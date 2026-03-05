@@ -1,0 +1,5 @@
+export type { OpType, Op, DocumentState, VectorClock } from './type'
+export { insert, del, retain } from './operations'
+export { apply } from './apply'
+export { compose } from './compose'
+export { transform } from './transform'
