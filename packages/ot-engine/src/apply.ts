@@ -1,21 +1,29 @@
-import type { Op, DocumentState } from './type'
+import { DocumentState, Op } from './type'
 
+/**
+ * Applies a single operation to a document, returning the new document state.
+ *
+ * For delete ops, `deletedContent` is set on the op object so that `invert()`
+ * can reconstruct the exact inverse insert. Positions are clamped to valid
+ * bounds so no operation can throw a range error.
+ */
 export function apply(doc: DocumentState, op: Op): DocumentState {
-  if (op.type === 'insert') {
-    // Empty string is the no-op sentinel produced by transform() when an insert
-    // lands inside a concurrently deleted range — the surrounding chars are gone.
-    if (op.content === undefined || op.content === '') return doc
-    const content = doc.content.slice(0, op.position) + op.content + doc.content.slice(op.position)
-    return { content, version: doc.version + 1 }
+  switch (op.type) {
+    case 'insert': {
+      const pos = Math.min(Math.max(0, op.position), doc.content.length)
+      const content = doc.content.slice(0, pos) + op.content + doc.content.slice(pos)
+      return { content, version: doc.version + 1 }
+    }
+    case 'delete': {
+      const pos = Math.min(Math.max(0, op.position), doc.content.length)
+      const len = Math.min(op.length, doc.content.length - pos)
+      // Annotate the op so invert() can produce the correct inverse insert.
+      op.deletedContent = doc.content.slice(pos, pos + len)
+      const content = doc.content.slice(0, pos) + doc.content.slice(pos + len)
+      return { content, version: doc.version + 1 }
+    }
+    case 'retain': {
+      return { ...doc, version: doc.version + 1 }
+    }
   }
-
-  if (op.type === 'delete') {
-    // Zero-length delete is a no-op (both clients deleted the same range).
-    if (op.length === undefined || op.length === 0) return doc
-    const content = doc.content.slice(0, op.position) + doc.content.slice(op.position + op.length)
-    return { content, version: doc.version + 1 }
-  }
-
-  // retain — intentional no-op placeholder
-  return doc
 }

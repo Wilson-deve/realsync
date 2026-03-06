@@ -1,21 +1,28 @@
-import type { Op } from './type'
+import { InsertOp, DeleteOp, RetainOp } from './type'
 
-/** Create a validated insert operation. */
-export function insert(position: number, content: string): Op {
-  if (position < 0) throw new RangeError(`insert: position must be >= 0, got ${position}`)
-  if (content.length === 0) throw new RangeError('insert: content must be non-empty')
-  return { type: 'insert', position, content }
+/**
+ * Creates an insert operation.
+ */
+export function insert(
+  position: number,
+  content: string,
+  attributes?: Record<string, unknown>
+): InsertOp {
+  return attributes
+    ? { type: 'insert', position, content, attributes }
+    : { type: 'insert', position, content }
 }
 
-/** Create a validated delete operation. ('delete' is a reserved word — use del) */
-export function del(position: number, length: number): Op {
-  if (position < 0) throw new RangeError(`del: position must be >= 0, got ${position}`)
-  if (length <= 0) throw new RangeError(`del: length must be > 0, got ${length}`)
+/**
+ * Creates a delete operation.
+ */
+export function del(position: number, length: number): DeleteOp {
   return { type: 'delete', position, length }
 }
 
-/** Create a retain operation (skip-N-chars placeholder). */
-export function retain(length: number): Op {
-  if (length <= 0) throw new RangeError(`retain: length must be > 0, got ${length}`)
-  return { type: 'retain', position: 0, length }
+/**
+ * Creates a retain operation.
+ */
+export function retain(length: number, attributes?: Record<string, unknown>): RetainOp {
+  return attributes ? { type: 'retain', length, attributes } : { type: 'retain', length }
 }
