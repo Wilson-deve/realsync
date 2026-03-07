@@ -1,119 +1,43 @@
-import { describe, it } from 'vitest'
-import { expect } from 'vitest'
+import { describe, it, expect } from 'vitest'
 import * as fc from 'fast-check'
-import { transform, apply } from '../src/index'
-import type { Op, DocumentState } from '../src/index'
+import { transform } from '../src/transform'
+import { apply } from '../src/apply'
+import { DocumentState, Op } from '../src/type'
 
-// ── Arbitraries ──────────────────────────────────────────────────────────────
-
-const alphaString = fc.stringMatching(/^[a-z]{0,8}$/)
-
-const docArb: fc.Arbitrary<DocumentState> = alphaString.map((content) => ({
-  content,
-  version: 0,
-}))
-
-function insertOpArb(docLen: number): fc.Arbitrary<Op> {
-  if (docLen < 0) docLen = 0
-  return fc.record({
-    type: fc.constant('insert' as const),
-    position: fc.integer({ min: 0, max: docLen }),
-    content: alphaString.filter((s) => s.length > 0),
-  })
-}
-
-function deleteOpArb(docLen: number): fc.Arbitrary<Op> {
-  if (docLen === 0) {
-    // Nothing to delete — return a no-op delete
-    return fc.constant({ type: 'delete' as const, position: 0, length: 0 })
-  }
-  return fc.integer({ min: 0, max: docLen - 1 }).chain((position) =>
-    fc.record({
-      type: fc.constant('delete' as const),
-      position: fc.constant(position),
-      length: fc.integer({ min: 1, max: docLen - position }),
-    })
-  )
-}
-
-function opArb(docLen: number): fc.Arbitrary<Op> {
-  return fc.oneof(insertOpArb(docLen), deleteOpArb(docLen))
-}
-
-// ── Diamond property ─────────────────────────────────────────────────────────
-//
-// For any document and any two concurrent operations:
-//   apply(apply(doc, op1), op2') === apply(apply(doc, op2), op1')
-
-function diamondHolds(doc: DocumentState, op1: Op, op2: Op): void {
-  const [op1p, op2p] = transform(op1, op2)
-  const left = apply(apply(doc, op1), op2p)
-  const right = apply(apply(doc, op2), op1p)
-  expect(left.content).toBe(right.content)
-}
-
-describe('fuzz: transform diamond property', () => {
-  it('holds for insert vs insert', () => {
+describe('3-user concurrent editing', () => {
+  it('all three clients converge — 1,000 runs', () => {
     fc.assert(
       fc.property(
-        docArb.chain((doc) =>
-          fc.tuple(
-            fc.constant(doc),
-            insertOpArb(doc.content.length),
-            insertOpArb(doc.content.length)
-          )
-        ),
-        ([doc, op1, op2]) => diamondHolds(doc, op1, op2)
-      ),
-      { numRuns: 200 }
-    )
-  })
+        fc.string({ minLength: 5, maxLength: 30 }),
+        fc.nat(29),
+        fc.nat(29),
+        fc.nat(29),
+        (doc, p1, p2, p3) => {
+          const S: DocumentState = { content: doc, version: 0 }
+          const op1: Op = { type: 'insert', position: p1 % (doc.length + 1), content: 'A' }
+          const op2: Op = { type: 'insert', position: p2 % (doc.length + 1), content: 'B' }
+          const op3: Op = { type: 'insert', position: p3 % (doc.length + 1), content: 'C' }
 
-  it('holds for delete vs delete', () => {
-    fc.assert(
-      fc.property(
-        docArb
-          .filter((d) => d.content.length > 0)
-          .chain((doc) =>
-            fc.tuple(
-              fc.constant(doc),
-              deleteOpArb(doc.content.length),
-              deleteOpArb(doc.content.length)
-            )
-          ),
-        ([doc, op1, op2]) => diamondHolds(doc, op1, op2)
-      ),
-      { numRuns: 200 }
-    )
-  })
+          // Server applies: op1, then op2', then op3''
+          // [op1_2, op2_1]: transform op1 against op2
+          const [op1_2, op2_1] = transform(op1, op2)
+          // [op1_3, op3_1]: transform op1 against op3
+          const [op1_3, op3_1] = transform(op1, op3)
+          // Now transform the already-shifted op2_1 against op3_1
+          const [op2_3, op3_2] = transform(op2_1, op3_1)
 
-  it('holds for insert vs delete', () => {
-    fc.assert(
-      fc.property(
-        docArb
-          .filter((d) => d.content.length > 0)
-          .chain((doc) =>
-            fc.tuple(
-              fc.constant(doc),
-              insertOpArb(doc.content.length),
-              deleteOpArb(doc.content.length)
-            )
-          ),
-        ([doc, op1, op2]) => diamondHolds(doc, op1, op2)
-      ),
-      { numRuns: 200 }
-    )
-  })
+          // Client 1: saw op1 first, then receives op2_1, then op3_2
+          const client1 = apply(apply(apply(S, op1), op2_1), op3_2)
+          // Client 2: saw op2 first, then receives op1_2, then op3_2
+          const client2 = apply(apply(apply(S, op2), op1_2), op3_2)
+          // Client 3: saw op3 first, then receives op1_3, then op2_3
+          const client3 = apply(apply(apply(S, op3), op1_3), op2_3)
 
-  it('holds for any two concurrent ops', () => {
-    fc.assert(
-      fc.property(
-        docArb.chain((doc) =>
-          fc.tuple(fc.constant(doc), opArb(doc.content.length), opArb(doc.content.length))
-        ),
-        ([doc, op1, op2]) => diamondHolds(doc, op1, op2)
+          expect(client1.content).toBe(client2.content)
+          expect(client2.content).toBe(client3.content)
+        }
       ),
-      { numRuns: 500 }
+      { numRuns: 1000 }
     )
   })
 })

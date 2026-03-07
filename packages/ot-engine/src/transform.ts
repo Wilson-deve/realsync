@@ -1,139 +1,90 @@
-import type { Op } from './type'
-
-export type { OpType, Op, DocumentState } from './type'
+import type { Op, InsertOp, DeleteOp } from './type'
 
 /**
- * Operational Transformation.
+ * Transforms two concurrent operations against each other.
  *
- * Given two operations (op1, op2) that were both applied against the
- * same document version (concurrent), returns [op1', op2'] such that:
+ * Returns `[op1', op2']` where:
+ *   - `op1'` is op1 adjusted to be applied AFTER op2
+ *   - `op2'` is op2 adjusted to be applied AFTER op1
  *
- *   apply(apply(doc, op1), op2') === apply(apply(doc, op2), op1')
- *
- * op1' = op1 transformed against op2  → apply after op2
- * op2' = op2 transformed against op1  → apply after op1
+ * Convergence guarantee:
+ *   `apply(apply(S, op1), op2') === apply(apply(S, op2), op1')`
  */
 export function transform(op1: Op, op2: Op): [Op, Op] {
-  if (op1.type === 'insert' && op2.type === 'insert') {
-    return transformII(op1, op2)
-  }
-  if (op1.type === 'insert' && op2.type === 'delete') {
-    return transformID(op1, op2)
-  }
+  if (op1.type === 'insert' && op2.type === 'insert') return transformII(op1, op2)
+  if (op1.type === 'insert' && op2.type === 'delete') return transformID(op1, op2)
   if (op1.type === 'delete' && op2.type === 'insert') {
-    // Symmetric: swap args, swap result
+    // transformID(ins, del) returns [ins', del'] = [op2', op1'].
+    // We need [op1', op2'], so swap the destructuring.
     const [op2p, op1p] = transformID(op2, op1)
     return [op1p, op2p]
   }
-  if (op1.type === 'delete' && op2.type === 'delete') {
-    return transformDD(op1, op2)
-  }
-  // retain is a no-op
-  return [op1, op2]
+  if (op1.type === 'delete' && op2.type === 'delete') return transformDD(op1, op2)
+  // retain pairs: neither side changes position
+  return [{ ...op1 }, { ...op2 }]
 }
 
-// ─── insert vs insert ────────────────────────────────────────────────────────
-//
-// Tie-break rule: when both insert at the same position, op1 keeps its
-// position (op1 has priority) and op2 shifts right. This must be applied
-// consistently on every client to converge.
-
-function transformII(op1: Op, op2: Op): [Op, Op] {
-  const p1 = op1.position
-  const p2 = op2.position
-  const l1 = op1.content?.length ?? 0
-  const l2 = op2.content?.length ?? 0
-
-  // op1' against op2: if op2 inserted strictly before p1, shift right
-  const op1p: Op = p2 < p1 ? { ...op1, position: p1 + l2 } : { ...op1 }
-
-  // op2' against op1: if op1 inserted at or before p2, shift right
-  // (handles the tie-break: p1 === p2 → op2 shifts)
-  const op2p: Op = p1 <= p2 ? { ...op2, position: p2 + l1 } : { ...op2 }
-
-  return [op1p, op2p]
+function transformII(op1: InsertOp, op2: InsertOp): [Op, Op] {
+  if (op1.position < op2.position) {
+    return [{ ...op1 }, { ...op2, position: op2.position + op1.content.length }]
+  }
+  if (op1.position > op2.position) {
+    return [{ ...op1, position: op1.position + op2.content.length }, { ...op2 }]
+  }
+  // Same position: op1 wins (deterministic server-side tie-break)
+  return [{ ...op1 }, { ...op2, position: op2.position + op1.content.length }]
 }
 
-// ─── insert vs delete ────────────────────────────────────────────────────────
-
-function transformID(opIns: Op, opDel: Op): [Op, Op] {
-  const pi = opIns.position
-  const pd = opDel.position
-  const ld = opDel.length ?? 0
-  const li = opIns.content?.length ?? 0
-
-  // opIns' against opDel:
-  //   Before delete range  → unchanged
-  //   Inside delete range  → the chars around the insert are gone; preserve the
-  //                          insert at pd BUT clear content so apply() skips it.
-  //                          This keeps op2' simple (a single expanded delete)
-  //                          while both paths still converge.
-  //   After  delete range  → shift left by ld
-  let opInsp: Op
-  if (pi <= pd) {
-    opInsp = { ...opIns }
-  } else if (pi < pd + ld) {
-    opInsp = { ...opIns, position: pd, content: '' } // no-op: content cleared
-  } else {
-    opInsp = { ...opIns, position: pi - ld }
+function transformID(ins: InsertOp, del: DeleteOp): [Op, Op] {
+  // Insert is entirely before the delete range: delete shifts right
+  if (ins.position <= del.position) {
+    return [{ ...ins }, { ...del, position: del.position + ins.content.length }]
   }
-
-  // opDel' against opIns:
-  //   Insert at or before delete start → shift delete right by li
-  //   Insert inside delete range       → expand delete to swallow new content
-  //   Insert after delete range        → unchanged
-  let opDelp: Op
-  if (pi <= pd) {
-    opDelp = { ...opDel, position: pd + li }
-  } else if (pi < pd + ld) {
-    opDelp = { ...opDel, length: ld + li }
-  } else {
-    opDelp = { ...opDel }
+  // Insert is entirely after the delete range: insert shifts left
+  if (ins.position >= del.position + del.length) {
+    return [{ ...ins, position: ins.position - del.length }, { ...del }]
   }
-
-  return [opInsp, opDelp]
+  // Insert is inside the deleted range: the delete "wins".
+  // Neutralize the insert (content: '' — no-op w.r.t. document content;
+  // note that apply() still increments version, which is correct because
+  // the op occupies a slot in the server's operation log) and expand
+  // the delete by the inserted length so it still covers the same logical
+  // region after the insertion shifted positions in path A.
+  // This is the only assignment of [op1', op2'] that satisfies:
+  //   apply(apply(S, ins), del') === apply(apply(S, del), ins')
+  return [
+    { ...ins, content: '' },
+    { ...del, length: del.length + ins.content.length },
+  ]
 }
 
-// ─── delete vs delete ────────────────────────────────────────────────────────
+function transformDD(op1: DeleteOp, op2: DeleteOp): [Op, Op] {
+  const op1End = op1.position + op1.length
+  const op2End = op2.position + op2.length
 
-function transformDD(op1: Op, op2: Op): [Op, Op] {
-  return [xformDel(op1, op2), xformDel(op2, op1)]
-}
-
-// Transform opA (delete) assuming opB (delete) was applied first.
-function xformDel(opA: Op, opB: Op): Op {
-  const pa = opA.position
-  const pb = opB.position
-  const la = opA.length ?? 0
-  const lb = opB.length ?? 0
-
-  // opB entirely before opA → shift opA left by lb
-  if (pb + lb <= pa) {
-    return { ...opA, position: pa - lb }
+  // op1 is entirely before op2
+  if (op1End <= op2.position) {
+    return [{ ...op1 }, { ...op2, position: op2.position - op1.length }]
   }
-
-  // opB entirely after opA → no change
-  if (pb >= pa + la) {
-    return { ...opA }
+  // op2 is entirely before op1
+  if (op2End <= op1.position) {
+    return [{ ...op1, position: op1.position - op2.length }, { ...op2 }]
   }
+  // Overlapping: each side only deletes what the other has not already deleted
+  const overlapStart = Math.max(op1.position, op2.position)
+  const overlapEnd = Math.min(op1End, op2End)
+  const overlap = overlapEnd - overlapStart
 
-  // opB completely covers opA → opA is already gone, become no-op
-  if (pb <= pa && pb + lb >= pa + la) {
-    return { ...opA, position: pb, length: 0 }
-  }
-
-  // opA completely covers opB → shrink opA by lb (overlap already deleted)
-  if (pa <= pb && pa + la >= pb + lb) {
-    return { ...opA, length: la - lb }
-  }
-
-  // Partial overlap: opA starts before opB, ends inside opB
-  // [pa ──── pb ── pa+la ────── pb+lb]
-  if (pa <= pb) {
-    return { ...opA, length: pb - pa }
-  }
-
-  // Partial overlap: opA starts inside opB, ends after opB
-  // [pb ──── pa ── pb+lb ────── pa+la]
-  return { ...opA, position: pb, length: pa + la - (pb + lb) }
+  return [
+    {
+      ...op1,
+      position: Math.min(op1.position, op2.position),
+      length: Math.max(0, op1.length - overlap),
+    },
+    {
+      ...op2,
+      position: Math.min(op1.position, op2.position),
+      length: Math.max(0, op2.length - overlap),
+    },
+  ]
 }

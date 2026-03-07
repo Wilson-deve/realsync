@@ -25,3 +25,5 @@ Thumbs.db
 
 # Prisma
 packages/server/prisma/migrations/
+
+.github/
