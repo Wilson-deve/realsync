@@ -1,4 +1,4 @@
-import { DocumentState, Op } from './type'
+import type { DocumentState, Op } from './type'
 
 /**
  * Applies a single operation to a document, returning the new document state.

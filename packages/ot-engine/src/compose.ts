@@ -1,4 +1,4 @@
-import { Op } from './type'
+import type { Op } from './type'
 
 /**
  * Shallow-equality check for op attributes.

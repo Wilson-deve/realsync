@@ -1,4 +1,4 @@
-import { InsertOp, DeleteOp, RetainOp } from './type'
+import type { InsertOp, DeleteOp, RetainOp } from './type'
 
 /**
  * Creates an insert operation.

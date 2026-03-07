@@ -1,4 +1,4 @@
-import { Op } from './type'
+import type { Op } from './type'
 
 /**
  * Returns the inverse of an operation such that applying the op and then its
@@ -25,6 +25,8 @@ export function invert(op: Op): Op {
     }
 
     case 'retain':
-      return { type: 'retain', length: op.length }
+      // Spread the original op so attributes are preserved — dropping them
+      // would make invert(retain) lose formatting metadata.
+      return { ...op }
   }
 }

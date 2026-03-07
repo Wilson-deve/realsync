@@ -61,6 +61,18 @@ describe('invert', () => {
       expect(invert(op)).toEqual({ type: 'retain', length: 10 })
     })
 
+    it('preserves attributes on retain', () => {
+      const op: Op = { type: 'retain', length: 5, attributes: { bold: true, color: 'red' } }
+      expect(invert(op)).toEqual({ type: 'retain', length: 5, attributes: { bold: true, color: 'red' } })
+    })
+
+    it('does not add attributes when original has none', () => {
+      const op: Op = { type: 'retain', length: 5 }
+      const inv = invert(op)
+      expect(inv).toEqual({ type: 'retain', length: 5 })
+      expect('attributes' in inv).toBe(false)
+    })
+
     it('round-trips retain (content unchanged)', () => {
       const d = doc('hello')
       const op: Op = { type: 'retain', length: 5 }

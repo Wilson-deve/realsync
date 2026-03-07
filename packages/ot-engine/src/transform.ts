@@ -1,4 +1,4 @@
-import { Op, InsertOp, DeleteOp } from './type'
+import type { Op, InsertOp, DeleteOp } from './type'
 
 /**
  * Transforms two concurrent operations against each other.
