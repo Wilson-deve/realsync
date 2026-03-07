@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import * as fc from 'fast-check'
 import { compose } from '../src/compose'
 import { apply } from '../src/apply'
 import { invert } from '../src/invert'
@@ -160,5 +161,51 @@ describe('compose', () => {
       ]
       expect(compose(ops)).toHaveLength(1)
     })
+  })
+
+  it('compose is semantically equivalent to sequential apply — 2,000 runs', () => {
+    fc.assert(
+      fc.property(
+        fc.string({ minLength: 1, maxLength: 30 }),
+        fc.array(
+          fc.oneof(
+            fc.record({
+              type: fc.constant('insert' as const),
+              position: fc.nat(30),
+              content: fc.string({ minLength: 1, maxLength: 5 }),
+            }),
+            fc.record({
+              type: fc.constant('delete' as const),
+              position: fc.nat(29),
+              length: fc.integer({ min: 1, max: 10 }),
+            }),
+          ),
+          { minLength: 1, maxLength: 6 },
+        ),
+        (docContent, rawOps) => {
+          // Build valid ops by tracking the running document length
+          const ops: Op[] = []
+          let content = docContent
+          for (const raw of rawOps) {
+            if (raw.type === 'insert') {
+              const pos = raw.position % (content.length + 1)
+              ops.push({ type: 'insert', position: pos, content: raw.content })
+              content = content.slice(0, pos) + raw.content + content.slice(pos)
+            } else {
+              if (content.length === 0) continue
+              const pos = raw.position % content.length
+              const len = Math.min(raw.length, content.length - pos)
+              if (len === 0) continue
+              ops.push({ type: 'delete', position: pos, length: len })
+              content = content.slice(0, pos) + content.slice(pos + len)
+            }
+          }
+          if (ops.length === 0) return
+          const d: DocumentState = { content: docContent, version: 0 }
+          expect(applyAll(d, compose(ops)).content).toBe(applyAll(d, ops).content)
+        },
+      ),
+      { numRuns: 2000 },
+    )
   })
 })
