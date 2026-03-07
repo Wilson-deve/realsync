@@ -35,3 +35,9 @@ export interface DocumentState {
   /** Increments by 1 on every successfully applied operation. */
   version: number
 }
+
+/**
+ * Maps clientId → last sequence number seen from that client.
+ * Used by the server to detect out-of-order or duplicate op submissions.
+ */
+export type VectorClock = Record<string, number>

@@ -1,8 +1,14 @@
 import { Op } from './type'
 
 /**
- * Deep-equality check for op attributes.
- * Two attribute maps are compatible only if they are structurally identical.
+ * Shallow-equality check for op attributes.
+ *
+ * Compares own keys and values with `===`. This is intentionally shallow:
+ * attribute values in this engine are primitives (string | number | boolean),
+ * so a strict shallow comparison is both correct and sufficient.
+ * If nested attribute objects are ever introduced, this must be upgraded to
+ * a recursive deep-equal before that change ships.
+ *
  * `undefined` is treated as "no attributes" and equals only `undefined`.
  */
 function attrsEqual(

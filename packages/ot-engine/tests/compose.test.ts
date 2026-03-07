@@ -87,7 +87,7 @@ describe('compose', () => {
       const op2: DeleteOp = { type: 'delete', position: 2, length: 3 }
       // Apply each individually to populate deletedContent
       apply(d, op1) // op1.deletedContent = 'll'
-      apply({ content: 'heo world', version: 1 }, op2) // op2.deletedContent = 'o wo'
+      apply({ content: 'heo world', version: 1 }, op2) // op2.deletedContent = 'o w'
       const composed = compose([op1, op2])
       expect(composed).toHaveLength(1)
       const inv = invert(composed[0])
