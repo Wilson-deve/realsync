@@ -16,7 +16,7 @@ export function apply(doc: DocumentState, op: Op): DocumentState {
     }
     case 'delete': {
       const pos = Math.min(Math.max(0, op.position), doc.content.length)
-      const len = Math.min(op.length, doc.content.length - pos)
+      const len = Math.max(0, Math.min(op.length, doc.content.length - pos))
       // Annotate the op so invert() can produce the correct inverse insert.
       op.deletedContent = doc.content.slice(pos, pos + len)
       const content = doc.content.slice(0, pos) + doc.content.slice(pos + len)

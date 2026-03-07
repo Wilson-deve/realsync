@@ -44,10 +44,16 @@ function transformID(ins: InsertOp, del: DeleteOp): [Op, Op] {
   if (ins.position >= del.position + del.length) {
     return [{ ...ins, position: ins.position - del.length }, del]
   }
-  // Insert is inside the deleted range: move it to the deletion start.
-  // The deletion "wins" positionally; the inserted content is preserved but
-  // relocated to the boundary of the deleted region.
-  return [{ ...ins, position: del.position }, del]
+  // Insert is inside the deleted range: the delete "wins".
+  // Neutralize the insert (zero-length so apply() is a no-op) and expand
+  // the delete by the inserted length so it still covers the same logical
+  // region after the insertion shifted positions in path A.
+  // This is the only assignment of [op1', op2'] that satisfies:
+  //   apply(apply(S, ins), del') === apply(apply(S, del), ins')
+  return [
+    { ...ins, content: '' },
+    { ...del, length: del.length + ins.content.length },
+  ]
 }
 
 function transformDD(op1: DeleteOp, op2: DeleteOp): [Op, Op] {

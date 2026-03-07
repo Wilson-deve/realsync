@@ -1,7 +1,8 @@
 import { describe, it, expect } from 'vitest'
 import { compose } from '../src/compose'
 import { apply } from '../src/apply'
-import { DocumentState, Op } from '../src/type'
+import { invert } from '../src/invert'
+import { DocumentState, Op, DeleteOp } from '../src/type'
 
 const doc = (content: string): DocumentState => ({ content, version: 0 })
 
@@ -48,6 +49,52 @@ describe('compose', () => {
     expect(result[0]).toMatchObject({ type: 'delete', position: 2, length: 3 })
   })
 
+  describe('delete merge — deletedContent handling', () => {
+    it('concatenates deletedContent when both ops are annotated', () => {
+      const ops: Op[] = [
+        { type: 'delete', position: 2, length: 2, deletedContent: 'll' },
+        { type: 'delete', position: 2, length: 3, deletedContent: 'o w' },
+      ]
+      const result = compose(ops)
+      expect(result).toHaveLength(1)
+      expect((result[0] as DeleteOp).deletedContent).toBe('llo w')
+      expect((result[0] as DeleteOp).length).toBe(5)
+    })
+
+    it('leaves deletedContent undefined when neither op is annotated', () => {
+      const ops: Op[] = [
+        { type: 'delete', position: 2, length: 2 },
+        { type: 'delete', position: 2, length: 3 },
+      ]
+      const result = compose(ops)
+      expect(result).toHaveLength(1)
+      expect((result[0] as DeleteOp).deletedContent).toBeUndefined()
+    })
+
+    it('drops deletedContent when only one op is annotated (mixed state)', () => {
+      const ops: Op[] = [
+        { type: 'delete', position: 2, length: 2, deletedContent: 'll' },
+        { type: 'delete', position: 2, length: 3 },
+      ]
+      const result = compose(ops)
+      expect(result).toHaveLength(1)
+      expect((result[0] as DeleteOp).deletedContent).toBeUndefined()
+    })
+
+    it('round-trips correctly through invert() when both ops were applied', () => {
+      const d = doc('hello world')
+      const op1: DeleteOp = { type: 'delete', position: 2, length: 2 }
+      const op2: DeleteOp = { type: 'delete', position: 2, length: 3 }
+      // Apply each individually to populate deletedContent
+      apply(d, op1) // op1.deletedContent = 'll'
+      apply({ content: 'heo world', version: 1 }, op2) // op2.deletedContent = 'o wo'
+      const composed = compose([op1, op2])
+      expect(composed).toHaveLength(1)
+      const inv = invert(composed[0])
+      expect(inv).toMatchObject({ type: 'insert', position: 2, content: 'llo w' })
+    })
+  })
+
   it('composed result produces same document as applying each op individually', () => {
     const d = doc('hello world')
     const ops: Op[] = [
@@ -77,5 +124,41 @@ describe('compose', () => {
       { type: 'delete', position: 2, length: 1 },
     ]
     expect(compose(ops)).toHaveLength(2)
+  })
+
+  describe('attribute compatibility', () => {
+    it('merges adjacent inserts with identical attributes', () => {
+      const ops: Op[] = [
+        { type: 'insert', position: 0, content: 'A', attributes: { bold: true } },
+        { type: 'insert', position: 1, content: 'B', attributes: { bold: true } },
+      ]
+      const result = compose(ops)
+      expect(result).toHaveLength(1)
+      expect(result[0]).toMatchObject({ content: 'AB', attributes: { bold: true } })
+    })
+
+    it('does NOT merge adjacent inserts with different attributes', () => {
+      const ops: Op[] = [
+        { type: 'insert', position: 0, content: 'A', attributes: { bold: true } },
+        { type: 'insert', position: 1, content: 'B', attributes: { italic: true } },
+      ]
+      expect(compose(ops)).toHaveLength(2)
+    })
+
+    it('does NOT merge when one insert has attributes and the other does not', () => {
+      const ops: Op[] = [
+        { type: 'insert', position: 0, content: 'A', attributes: { bold: true } },
+        { type: 'insert', position: 1, content: 'B' },
+      ]
+      expect(compose(ops)).toHaveLength(2)
+    })
+
+    it('merges adjacent inserts both without attributes', () => {
+      const ops: Op[] = [
+        { type: 'insert', position: 0, content: 'A' },
+        { type: 'insert', position: 1, content: 'B' },
+      ]
+      expect(compose(ops)).toHaveLength(1)
+    })
   })
 })

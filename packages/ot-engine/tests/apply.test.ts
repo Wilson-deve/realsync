@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { apply } from '../src/apply'
+import { insert, del, retain } from '../src/operations'
 import { DocumentState, DeleteOp } from '../src/type'
 
 const doc = (content: string): DocumentState => ({ content, version: 0 })
@@ -43,6 +44,9 @@ describe('apply', () => {
     it('clamps length that would exceed document bounds', () => {
       expect(apply(doc('hello'), { type: 'delete', position: 3, length: 100 }).content).toBe('hel')
     })
+    it('clamps negative length to 0 — content unchanged', () => {
+      expect(apply(doc('hello'), { type: 'delete', position: 2, length: -5 }).content).toBe('hello')
+    })
     it('clamps position < 0 to 0', () => {
       expect(apply(doc('hello'), { type: 'delete', position: -1, length: 2 }).content).toBe('llo')
     })
@@ -66,6 +70,48 @@ describe('apply', () => {
       expect(apply(d, { type: 'insert', position: 0, content: 'x' }).version).toBe(1)
       expect(apply(d, { type: 'delete', position: 0, length: 1 }).version).toBe(1)
       expect(apply(d, { type: 'retain', length: 1 }).version).toBe(1)
+    })
+  })
+})
+
+describe('operations constructors — input validation', () => {
+  describe('insert()', () => {
+    it('creates a valid insert op', () => {
+      expect(insert(3, 'hi')).toEqual({ type: 'insert', position: 3, content: 'hi' })
+    })
+    it('throws on negative position', () => {
+      expect(() => insert(-1, 'x')).toThrow(RangeError)
+      expect(() => insert(-1, 'x')).toThrow('position must be >= 0')
+    })
+  })
+
+  describe('del()', () => {
+    it('creates a valid delete op', () => {
+      expect(del(2, 4)).toEqual({ type: 'delete', position: 2, length: 4 })
+    })
+    it('throws on negative position', () => {
+      expect(() => del(-1, 3)).toThrow(RangeError)
+      expect(() => del(-1, 3)).toThrow('position must be >= 0')
+    })
+    it('throws on negative length', () => {
+      expect(() => del(0, -1)).toThrow(RangeError)
+      expect(() => del(0, -1)).toThrow('length must be >= 0')
+    })
+    it('allows zero length (no-op delete)', () => {
+      expect(del(0, 0)).toEqual({ type: 'delete', position: 0, length: 0 })
+    })
+  })
+
+  describe('retain()', () => {
+    it('creates a valid retain op', () => {
+      expect(retain(5)).toEqual({ type: 'retain', length: 5 })
+    })
+    it('throws on negative length', () => {
+      expect(() => retain(-1)).toThrow(RangeError)
+      expect(() => retain(-1)).toThrow('length must be >= 0')
+    })
+    it('allows zero length', () => {
+      expect(retain(0)).toEqual({ type: 'retain', length: 0 })
     })
   })
 })

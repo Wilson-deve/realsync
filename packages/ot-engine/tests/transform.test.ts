@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest'
 import * as fc from 'fast-check'
 import { transform } from '../src/transform'
 import { apply } from '../src/apply'
-import { DocumentState, Op } from '../src/type'
+import { DocumentState, Op, InsertOp, DeleteOp } from '../src/type'
 
 describe('transform — deterministic cases', () => {
   it('II: op1 before op2 — op2 shifts right', () => {
@@ -45,12 +45,20 @@ describe('transform — deterministic cases', () => {
     expect(op2p).toEqual(op2)
   })
 
-  it('ID: insert inside delete range — moves to delete start', () => {
+  it('ID: insert inside delete range — insert neutralized, delete expanded', () => {
+    // Convergence proof for this case (doc = any string of length >= 9):
+    //   Path A: apply(insert(5,"X")), apply(delete(3, 5)) → same as Path B
+    //   Path B: apply(delete(3, 4)),  apply(no-op insert) → same as Path A
     const op1: Op = { type: 'insert', position: 5, content: 'X' }
     const op2: Op = { type: 'delete', position: 3, length: 4 }
     const [op1p, op2p] = transform(op1, op2)
-    expect((op1p as typeof op1).position).toBe(3)
-    expect(op2p).toEqual(op2)
+    // insert is neutralized
+    expect((op1p as InsertOp).content).toBe('')
+    // delete expands to absorb the inserted length
+    expect((op2p as DeleteOp).length).toBe(5) // 4 + 1
+    // convergence check
+    const S: DocumentState = { content: 'hello world!', version: 0 }
+    expect(apply(apply(S, op1), op2p).content).toBe(apply(apply(S, op2), op1p).content)
   })
 
   it('DI: symmetric of ID', () => {
