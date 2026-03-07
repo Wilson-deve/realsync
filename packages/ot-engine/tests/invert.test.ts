@@ -63,7 +63,11 @@ describe('invert', () => {
 
     it('preserves attributes on retain', () => {
       const op: Op = { type: 'retain', length: 5, attributes: { bold: true, color: 'red' } }
-      expect(invert(op)).toEqual({ type: 'retain', length: 5, attributes: { bold: true, color: 'red' } })
+      expect(invert(op)).toEqual({
+        type: 'retain',
+        length: 5,
+        attributes: { bold: true, color: 'red' },
+      })
     })
 
     it('does not add attributes when original has none', () => {
