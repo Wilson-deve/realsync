@@ -178,9 +178,9 @@ describe('compose', () => {
               type: fc.constant('delete' as const),
               position: fc.nat(29),
               length: fc.integer({ min: 1, max: 10 }),
-            }),
+            })
           ),
-          { minLength: 1, maxLength: 6 },
+          { minLength: 1, maxLength: 6 }
         ),
         (docContent, rawOps) => {
           // Build valid ops by tracking the running document length
@@ -203,9 +203,9 @@ describe('compose', () => {
           if (ops.length === 0) return
           const d: DocumentState = { content: docContent, version: 0 }
           expect(applyAll(d, compose(ops)).content).toBe(applyAll(d, ops).content)
-        },
+        }
       ),
-      { numRuns: 2000 },
+      { numRuns: 2000 }
     )
   })
 })
