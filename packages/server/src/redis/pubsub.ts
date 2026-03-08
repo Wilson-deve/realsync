@@ -6,7 +6,7 @@ import { logger } from '../utils/logger'
 //   presence:{docId}     cursor + user state for a document
 //   workspace:{wsId}     workspace-level events
 
-type MessageHandler = (data: unknown) => void
+type MessageHandler = (data: unknown) => void | Promise<void>
 
 /**
  * Single shared dispatch map: channel → set of handlers.
@@ -42,11 +42,11 @@ subClient.on('message', (channel, message) => {
     return
   }
   for (const handler of handlers) {
-    try {
-      handler(parsed)
-    } catch (err) {
-      logger.warn({ channel, err }, 'Redis: message handler threw — skipping')
-    }
+    Promise.resolve()
+      .then(() => handler(parsed))
+      .catch((err: unknown) => {
+        logger.warn({ channel, err }, 'Redis: message handler threw — skipping')
+      })
   }
 })
 
