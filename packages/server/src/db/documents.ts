@@ -25,13 +25,9 @@ export async function getDocument(docId: string) {
  * Called by the OT handler after each successfully applied operation
  * to keep an up-to-date content cache without replaying all operations.
  */
-export async function updateSnapshot(
-  docId: string,
-  content: string,
-  version: number,
-) {
+export async function updateSnapshot(docId: string, content: string, version: number) {
   return prisma.document.update({
     where: { id: docId },
-    data:  { snapshotContent: content, snapshotVersion: version },
+    data: { snapshotContent: content, snapshotVersion: version },
   })
 }

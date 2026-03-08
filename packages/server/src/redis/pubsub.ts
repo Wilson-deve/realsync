@@ -1,9 +1,35 @@
 import { pubClient, subClient } from './client'
+import { logger } from '../utils/logger'
 
 // Channel naming convention — always follow this:
 //   doc:{docId}          operations for a specific document
 //   presence:{docId}     cursor + user state for a document
 //   workspace:{wsId}     workspace-level events
+
+type MessageHandler = (data: unknown) => void
+
+/**
+ * Single shared dispatch map: channel → set of handlers.
+ * A single 'message' listener on subClient fans out to the right handlers
+ * instead of adding one listener per subscribe() call.
+ */
+const channelHandlers = new Map<string, Set<MessageHandler>>()
+
+subClient.on('message', (channel, message) => {
+  const handlers = channelHandlers.get(channel)
+  if (!handlers) return
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(message)
+  } catch {
+    // Malformed JSON — log and ignore. Never crash the process over a bad message.
+    logger.warn({ channel, message }, 'Redis: received malformed JSON message')
+    return
+  }
+  for (const handler of handlers) {
+    handler(parsed)
+  }
+})
 
 /**
  * Publish a JSON-serialisable payload to a Redis channel.
@@ -15,20 +41,27 @@ export async function publish(channel: string, data: unknown): Promise<void> {
 
 /**
  * Subscribe to a Redis channel and invoke `handler` for each message.
- * Parses the message as JSON before passing it to the handler.
- * Malformed JSON is silently ignored — it never crashes the process.
+ * Multiple handlers on the same channel share a single Redis subscription
+ * and a single 'message' listener — no per-call listener is added.
+ * Returns an unsubscribe function that removes this handler only.
  */
-export function subscribe(channel: string, handler: (data: unknown) => void): void {
-  subClient.subscribe(channel, (err) => {
-    if (err) throw new Error(`Redis subscribe error on channel ${channel}: ${err.message}`)
-  })
+export function subscribe(channel: string, handler: MessageHandler): () => void {
+  if (!channelHandlers.has(channel)) {
+    channelHandlers.set(channel, new Set())
+    subClient.subscribe(channel, (err) => {
+      if (err) throw new Error(`Redis subscribe error on channel ${channel}: ${err.message}`)
+    })
+  }
 
-  subClient.on('message', (ch, message) => {
-    if (ch !== channel) return
-    try {
-      handler(JSON.parse(message))
-    } catch {
-      // Malformed JSON — log and ignore. Never crash the process over a bad message.
+  channelHandlers.get(channel)!.add(handler)
+
+  return () => {
+    const handlers = channelHandlers.get(channel)
+    if (!handlers) return
+    handlers.delete(handler)
+    if (handlers.size === 0) {
+      channelHandlers.delete(channel)
+      subClient.unsubscribe(channel)
     }
-  })
+  }
 }
