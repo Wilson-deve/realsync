@@ -24,38 +24,46 @@ export interface SocketData {
  * `io.to(docId).emit(OP_BROADCAST, ...)` → clients on B receive the op.
  */
 function setupCrossNodeBroadcast(io: Server): void {
-  // Track per-doc unsubscribe functions returned by pubsub.subscribe().
-  const unsubscribeFns = new Map<string, () => Promise<void>>()
+  // Keyed by room name.  The value is the pending subscribe() promise while
+  // the SUBSCRIBE is in flight, and the resolved unsubscribe function once it
+  // completes.  Storing the promise immediately (before subscribe() resolves)
+  // prevents two rapid join-room events from both calling subscribe() and
+  // registering duplicate message handlers for the same room.
+  const roomState = new Map<string, Promise<() => Promise<void>>>()
 
-  // Subscribe when the FIRST local socket joins a doc room, unsubscribe when
-  // the LAST local socket leaves.  Socket.io gives every socket a personal
-  // room named after its socket.id; skip those by checking room === id.
   io.of('/').adapter.on('join-room', (room: string, id: string) => {
     if (room === id) return
-    if (unsubscribeFns.has(room)) return // already subscribed for this room
-    subscribe(`doc:${room}`, (data: unknown) => {
+    if (roomState.has(room)) return // subscribe already in flight or completed
+
+    const pending = subscribe(`doc:${room}`, (data: unknown) => {
       io.to(room).emit(WS.OP_BROADCAST, data)
+    }).catch((err: unknown) => {
+      // Subscribe failed — remove the entry so a future join can retry.
+      roomState.delete(room)
+      logger.error({ err, room }, 'Redis subscribe failed — cross-node broadcast disabled for room')
+      // Return a no-op unsubscribe so the Promise type is consistent.
+      return async () => { /* no-op */ }
     })
-      .then((unsub) => {
-        unsubscribeFns.set(room, unsub)
-      })
-      .catch((err: unknown) => {
-        logger.error(
-          { err, room },
-          'Redis subscribe failed — cross-node broadcast disabled for room'
-        )
-      })
+
+    roomState.set(room, pending)
   })
 
   io.of('/').adapter.on('leave-room', (room: string, id: string) => {
     if (room === id) return
     if (io.sockets.adapter.rooms.get(room)) return // other sockets still in the room
-    const unsub = unsubscribeFns.get(room)
-    if (!unsub) return
-    unsubscribeFns.delete(room)
-    unsub().catch((err: unknown) => {
-      logger.warn({ err, room }, 'Redis unsubscribe failed')
-    })
+
+    const pending = roomState.get(room)
+    if (!pending) return
+    roomState.delete(room)
+
+    // Await the in-flight subscribe (if still pending) then unsubscribe.
+    // This handles the race where the last socket leaves before subscribe()
+    // resolves — without this the Redis subscription would leak indefinitely.
+    pending
+      .then((unsub) => unsub())
+      .catch((err: unknown) => {
+        logger.warn({ err, room }, 'Redis unsubscribe failed')
+      })
   })
 }
 
@@ -80,7 +88,9 @@ function setupCrossNodeBroadcast(io: Server): void {
  * @param httpServer  The Node.js HTTP server to attach Socket.io to.
  * @returns           The configured `Server` instance.
  */
-export function createWebSocketServer(httpServer: HttpServer): Server {
+export function createWebSocketServer(
+  httpServer: HttpServer
+): Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData> {
   const io = new Server<
     ClientToServerEvents,
     ServerToClientEvents,

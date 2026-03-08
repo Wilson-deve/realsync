@@ -50,7 +50,7 @@ function isValidOp(value: unknown): value is Op {
  * Handle an `op:submit` event from a connected client.
  *
  * This is the critical hot path — every keystroke flows through here.
- * The 8-step OT flow ensures all concurrently-editing clients converge
+ * The 9-step OT flow ensures all concurrently-editing clients converge
  * to the same document state:
  *
  *  1. Validate the incoming payload.
@@ -159,14 +159,14 @@ export async function handleOpSubmit(
     // Step 7 — update the version counter in Redis.
     await setDocVersion(docId, serverVersion)
 
-    // Step 7 — acknowledge the sender.
+    // Step 8 — acknowledge the sender.
     // The op is durably persisted and the version counter is advanced, so we
-    // ack unconditionally here.  Broadcast can fail independently (see step 8)
+    // ack unconditionally here.  Broadcast can fail independently (see step 9)
     // but the committed serverVersion must be returned to the client so it can
     // update its local version and avoid retrying an already-applied op.
     socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
 
-    // Step 8 — broadcast to all clients via Redis pub/sub.
+    // Step 9 — broadcast to all clients via Redis pub/sub.
     // If publish() fails (transient Redis error), fall back to a local
     // io.to(docId).emit so clients on THIS node still receive the op.
     // Clients on other nodes will catch up via doc:reconnect on their next
