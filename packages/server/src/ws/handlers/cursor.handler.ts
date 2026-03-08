@@ -26,11 +26,14 @@ export async function handleCursorUpdate(
     typeof payload !== 'object' ||
     payload === null ||
     typeof (payload as Record<string, unknown>).docId !== 'string' ||
-    typeof (payload as Record<string, unknown>).cursor !== 'number'
+    typeof (payload as Record<string, unknown>).cursor !== 'number' ||
+    !Number.isFinite((payload as Record<string, unknown>).cursor as number) ||
+    !Number.isInteger((payload as Record<string, unknown>).cursor as number) ||
+    ((payload as Record<string, unknown>).cursor as number) < 0
   ) {
     socket.emit(WS.ERROR, {
       code: 'INVALID_PAYLOAD',
-      message: 'cursor:update requires docId and cursor',
+      message: 'cursor:update requires docId and a non-negative integer cursor',
     })
     return
   }

@@ -4,7 +4,13 @@ import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
 import { getOperationsSince, saveOperation, getMaxOperationVersion } from '../../db/operations'
 import { publish } from '../../redis/pubsub'
-import { acquireLock, releaseLock, getDocVersion, setDocVersion, getSession } from '../../redis/session'
+import {
+  acquireLock,
+  releaseLock,
+  getDocVersion,
+  setDocVersion,
+  getSession,
+} from '../../redis/session'
 import { transformAgainstServerOps } from '../../ot/server-ot'
 import { takeSnapshot } from '../../ot/snapshot'
 import { logger } from '../../utils/logger'
@@ -17,17 +23,25 @@ interface OpSubmitPayload {
   sessionId: string
 }
 
+function isNonNegativeInteger(n: unknown): boolean {
+  return typeof n === 'number' && Number.isFinite(n) && Number.isInteger(n) && n >= 0
+}
+
+function isPositiveInteger(n: unknown): boolean {
+  return typeof n === 'number' && Number.isFinite(n) && Number.isInteger(n) && n > 0
+}
+
 function isValidOp(value: unknown): value is Op {
   if (typeof value !== 'object' || value === null) return false
   const v = value as Record<string, unknown>
   if (v.type === 'insert') {
-    return typeof v.position === 'number' && typeof v.content === 'string'
+    return isNonNegativeInteger(v.position) && typeof v.content === 'string'
   }
   if (v.type === 'delete') {
-    return typeof v.position === 'number' && typeof v.length === 'number'
+    return isNonNegativeInteger(v.position) && isPositiveInteger(v.length)
   }
   if (v.type === 'retain') {
-    return typeof v.length === 'number'
+    return isPositiveInteger(v.length)
   }
   return false
 }
@@ -80,7 +94,10 @@ export async function handleOpSubmit(
   // submitting ops — this prevents arbitrary document writes via a known docId.
   const session = await getSession(socket.id)
   if (!session || session.docId !== docId || !socket.rooms.has(docId)) {
-    socket.emit(WS.ERROR, { code: 'FORBIDDEN', message: 'Join the document room before submitting operations' })
+    socket.emit(WS.ERROR, {
+      code: 'FORBIDDEN',
+      message: 'Join the document room before submitting operations',
+    })
     return
   }
 
@@ -120,21 +137,32 @@ export async function handleOpSubmit(
     // Step 6 — update the version counter in Redis.
     await setDocVersion(docId, serverVersion)
 
-    // Step 7 — broadcast to all clients via Redis pub/sub, then ack the sender.
-    // The ack is intentionally sent AFTER publish so that a publish failure
-    // does not leave the sender believing the op was applied while no node
-    // has actually broadcast it to other connected clients.
-    // Publishing to Redis ensures ALL server nodes receive the message
-    // and forward it to their connected clients in the same room.
-    await publish(`doc:${docId}`, {
+    // Step 7 — acknowledge the sender.
+    // The op is durably persisted and the version counter is advanced, so we
+    // ack unconditionally here.  Broadcast can fail independently (see step 8)
+    // but the committed serverVersion must be returned to the client so it can
+    // update its local version and avoid retrying an already-applied op.
+    socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
+
+    // Step 8 — broadcast to all clients via Redis pub/sub.
+    // If publish() fails (transient Redis error), fall back to a local
+    // io.to(docId).emit so clients on THIS node still receive the op.
+    // Clients on other nodes will catch up via doc:reconnect on their next
+    // connection.  The publish failure is logged for alerting.
+    const broadcastPayload = {
       op: transformedOp,
       authorId: socket.data.userId,
       serverVersion,
-    })
-
-    // Step 8 — acknowledge back to the sender now that the op is persisted
-    // AND visible to every server node.
-    socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
+    }
+    try {
+      await publish(`doc:${docId}`, broadcastPayload)
+    } catch (pubErr) {
+      logger.error(
+        { pubErr, docId, serverVersion },
+        'op:submit: Redis publish failed — falling back to local broadcast'
+      )
+      io.to(docId).emit(WS.OP_BROADCAST, broadcastPayload)
+    }
 
     // Snapshot optimisation: every 100 ops, compute and store a full document
     // state to keep replay time bounded. Runs outside the lock window.

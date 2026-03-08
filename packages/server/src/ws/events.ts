@@ -1,3 +1,5 @@
+import type { SessionData } from '../redis/session'
+
 /** All Socket.io event name constants. Import from here — no magic strings elsewhere. */
 export const WS = {
   // Client → Server
@@ -16,8 +18,6 @@ export const WS = {
 } as const
 
 // ── Socket.io typed event maps ───────────────────────────────────────────────
-
-import type { SessionData } from '../redis/session'
 
 /** Events the server can emit to a client. */
 export interface ServerToClientEvents {

@@ -49,10 +49,16 @@ async function main(): Promise<void> {
   }
 
   process.on('SIGTERM', () => {
-    void shutdown('SIGTERM')
+    shutdown('SIGTERM').catch((err: unknown) => {
+      logger.error({ err }, 'shutdown: unhandled error — forcing exit')
+      process.exit(1)
+    })
   })
   process.on('SIGINT', () => {
-    void shutdown('SIGINT')
+    shutdown('SIGINT').catch((err: unknown) => {
+      logger.error({ err }, 'shutdown: unhandled error — forcing exit')
+      process.exit(1)
+    })
   })
 }
 
