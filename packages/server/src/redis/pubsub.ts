@@ -42,7 +42,14 @@ subClient.on('message', (channel, message) => {
     return
   }
   for (const handler of handlers) {
-    handler(parsed)
+    try {
+      handler(parsed)
+    } catch (err) {
+      logger.warn(
+        { channel, err: err instanceof Error ? err.message : String(err) },
+        'Redis: message handler threw — skipping'
+      )
+    }
   }
 })
 

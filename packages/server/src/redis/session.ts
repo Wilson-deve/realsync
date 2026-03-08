@@ -134,11 +134,10 @@ export async function getDocSessions(docId: string): Promise<SessionData[]> {
 export async function getDocVersion(docId: string): Promise<number> {
   const v = await pubClient.get(`doc-version:${docId}`)
   if (!v) return 0
-  const n = parseInt(v, 10)
-  if (!Number.isFinite(n)) {
+  if (!/^\d+$/.test(v)) {
     throw new Error(`Corrupt doc-version for ${docId}: stored value "${v}" is not a valid integer`)
   }
-  return n
+  return Number(v)
 }
 
 /** Persist the current version counter for a document. */
@@ -168,10 +167,18 @@ export async function acquireLock(
 ): Promise<string> {
   const token = randomUUID()
   const deadline = Date.now() + acquireTimeoutMs
+  let attempt = 0
   while (Date.now() < deadline) {
     const result = await pubClient.set(key, token, 'PX', lockTtlMs, 'NX')
     if (result === 'OK') return token
-    await new Promise<void>((r) => setTimeout(r, 10)) // back-off 10 ms before retry
+    // Exponential backoff with full jitter: delay in [0, min(cap, base * 2^attempt)].
+    // This avoids thundering-herd when many workers contend for the same lock.
+    const cap = 500
+    const base = 10
+    const ceiling = Math.min(cap, base * 2 ** attempt)
+    const delay = Math.floor(Math.random() * ceiling)
+    await new Promise<void>((r) => setTimeout(r, delay))
+    attempt++
   }
   throw new Error(`Could not acquire lock: ${key}`)
 }
