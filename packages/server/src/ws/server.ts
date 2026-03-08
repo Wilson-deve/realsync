@@ -97,7 +97,11 @@ export function createWebSocketServer(httpServer: HttpServer): Server {
       return next(new Error('AUTH_REQUIRED'))
     }
     try {
-      const decoded = jwt.verify(token, env.JWT_SECRET)
+      // Restrict to HS256 — the only algorithm compatible with a symmetric
+      // JWT_SECRET.  Without this constraint, an attacker could craft a token
+      // signed with RS256 (or the "none" algorithm) and jwt.verify() might
+      // accept it depending on the jsonwebtoken version.
+      const decoded = jwt.verify(token, env.JWT_SECRET, { algorithms: ['HS256'] })
 
       // jwt.verify() can return a string (for non-object JWTs) or an object
       // that is missing the claims we require. Cast only after explicit runtime

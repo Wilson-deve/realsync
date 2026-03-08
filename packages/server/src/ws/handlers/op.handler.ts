@@ -3,6 +3,7 @@ import type { Op } from '@realsync/ot-engine'
 import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
 import { getOperationsSince, saveOperation, getMaxOperationVersion } from '../../db/operations'
+import { getDocument } from '../../db/documents'
 import { publish } from '../../redis/pubsub'
 import {
   acquireLock,
@@ -54,12 +55,13 @@ function isValidOp(value: unknown): value is Op {
  *
  *  1. Validate the incoming payload.
  *  2. Acquire a per-document mutex (prevents version collisions).
- *  3. Fetch all server ops since the client's local version.
- *  4. Transform the client op against those server ops.
- *  5. Persist the *transformed* op with the new server version.
- *  6. Update the Redis version counter.
- *  7. Acknowledge the sender.
- *  8. Broadcast via Redis pub/sub to all server nodes.
+ *  3. Resolve the current server version; reject if client is ahead.
+ *  4. Fetch all server ops since the client's local version.
+ *  5. Transform the client op against those server ops.
+ *  6. Persist the *transformed* op with the new server version.
+ *  7. Update the Redis version counter.
+ *  8. Acknowledge the sender.
+ *  9. Broadcast via Redis pub/sub to all server nodes.
  *
  * The lock is always released in the finally block — a leaked lock would
  * permanently freeze editing for the affected document.
@@ -113,16 +115,11 @@ export async function handleOpSubmit(
   }
 
   try {
-    // Step 3 — fetch all operations applied since the client's version.
-    const serverOps = await getOperationsSince(docId, clientVersion)
-
-    // Step 4 — transform the incoming op against every server op since clientVersion.
-    const transformedOp = transformAgainstServerOps(op, serverOps)
-
-    // Step 5 — resolve the current version, initializing from DB if the Redis
-    // key is absent (server restart or cache eviction).  Without this, after
-    // eviction getDocVersion would return null → we would compute serverVersion=1
-    // and saveOperation would violate the @@unique([docId, version]) constraint.
+    // Step 3 — resolve the authoritative server version inside the lock.
+    // This must happen before fetching ops so we can detect a "client ahead"
+    // condition (clientVersion > currentVersion) which means the client has a
+    // version that doesn’t exist on the server yet — an impossible state under
+    // normal operation that indicates the client is out of sync.
     let currentVersion = await getDocVersion(docId)
     if (currentVersion === null) {
       // Key missing: seed Redis from the highest version already in Postgres.
@@ -130,10 +127,36 @@ export async function handleOpSubmit(
       await setDocVersion(docId, currentVersion)
       logger.info({ docId, currentVersion }, 'op:submit: seeded Redis version counter from DB')
     }
+
+    if (clientVersion > currentVersion) {
+      // Client claims to be ahead of the server — this should never happen in
+      // normal operation.  Force a reconnect so the client resets to the real
+      // server state rather than persisting a logically invalid op.
+      logger.warn(
+        { docId, clientVersion, currentVersion },
+        'op:submit: clientVersion ahead of server — forcing reconnect'
+      )
+      const doc = await getDocument(docId)
+      const ops = doc ? await getOperationsSince(docId, doc.snapshotVersion) : []
+      socket.emit(WS.DOC_RECONNECT, {
+        snapshot: doc?.snapshotContent ?? '',
+        version: doc?.snapshotVersion ?? 0,
+        ops,
+      })
+      return
+    }
+
+    // Step 4 — fetch all operations applied since the client’s version.
+    const serverOps = await getOperationsSince(docId, clientVersion)
+
+    // Step 5 — transform the incoming op against every server op since clientVersion.
+    const transformedOp = transformAgainstServerOps(op, serverOps)
+
+    // Step 6 — persist the transformed op with the new server version.
     const serverVersion = currentVersion + 1
     await saveOperation(docId, socket.data.userId, transformedOp, serverVersion)
 
-    // Step 6 — update the version counter in Redis.
+    // Step 7 — update the version counter in Redis.
     await setDocVersion(docId, serverVersion)
 
     // Step 7 — acknowledge the sender.
