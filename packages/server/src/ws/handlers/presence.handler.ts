@@ -4,16 +4,59 @@ import type { ServerToClientEvents, ClientToServerEvents } from '../events'
 import { getSession, setSession, getDocSessions } from '../../redis/session'
 import { logger } from '../../utils/logger'
 import type { SocketData } from '../server'
+import { env } from '../../config/env'
 
 interface PresencePingPayload {
   docId: string
 }
 
 /**
+ * Per-room debounce timers for presence broadcasts.
+ *
+ * When a ping arrives, setSession() is called immediately (O(1) Redis write),
+ * and a deferred broadcast is scheduled.  Subsequent pings within the window
+ * reset the timer so only ONE getDocSessions() call and ONE PRESENCE_UPDATE
+ * emit fire per PRESENCE_DEBOUNCE_MS interval, regardless of how many clients
+ * ping concurrently.  This collapses O(N) Redis work + O(N) network fanout
+ * per heartbeat into O(1) work amortised over the debounce window.
+ *
+ * Join and leave events skip this path and broadcast immediately (they already
+ * do so in rooms.ts), so clients always see an accurate presence list upon
+ * any membership change.
+ */
+const broadcastTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+function schedulePresenceBroadcast(
+  io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
+  docId: string
+): void {
+  const existing = broadcastTimers.get(docId)
+  if (existing !== undefined) clearTimeout(existing)
+
+  broadcastTimers.set(
+    docId,
+    setTimeout(() => {
+      broadcastTimers.delete(docId)
+      getDocSessions(docId)
+        .then((sessions) => {
+          io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })
+        })
+        .catch((err: unknown) => {
+          logger.warn({ err, docId }, 'presence: scheduled broadcast failed')
+        })
+    }, env.PRESENCE_DEBOUNCE_MS)
+  )
+}
+
+/**
  * Handle a `presence:ping` heartbeat event from a connected client.
  *
- * Refreshes the sender's `lastSeen` timestamp in the Redis session store
- * and broadcasts the updated presence list to everyone in the room.
+ * Updates the sender's `lastSeen` in Redis immediately (O(1)), then
+ * schedules a coalesced PRESENCE_UPDATE broadcast.  All pings arriving
+ * within PRESENCE_DEBOUNCE_MS (default 2 s) collapse into a single
+ * getDocSessions() read and one io.to(docId).emit(), reducing the
+ * per-heartbeat cost from O(N) to O(1) under concurrent load.
+ *
  * Clients should send this every 15–30 seconds to stay "active".
  */
 export async function handlePresencePing(
@@ -46,9 +89,12 @@ export async function handlePresencePing(
       return
     }
 
+    // O(1): refresh this socket's lastSeen — no list scan on the hot path.
     await setSession(socket.id, { ...session, lastSeen: Date.now() })
-    const sessions = await getDocSessions(docId)
-    io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })
+
+    // Coalesced broadcast: defers the expensive getDocSessions() + emit to
+    // the end of the debounce window so N concurrent pings cost O(1) not O(N).
+    schedulePresenceBroadcast(io, docId)
   } catch (err) {
     logger.error({ err, docId }, 'handlePresencePing: failed')
     socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to process ping' })

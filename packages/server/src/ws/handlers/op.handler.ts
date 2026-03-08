@@ -1,4 +1,4 @@
-import type { Server, Socket } from 'socket.io'
+﻿import type { Server, Socket } from 'socket.io'
 import type { Op } from '@realsync/ot-engine'
 import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
@@ -57,7 +57,8 @@ function isValidOp(value: unknown): value is Op {
  *
  *  1. Validate the incoming payload.
  *  2. Acquire a per-document mutex (prevents version collisions).
- *  3. Resolve the current server version; reject if client is ahead.
+ *  3. Resolve the current server version; reject if client is ahead or too
+ *     far behind (catch-up window exceeded → force resync).
  *  4. Fetch all server ops since the client's local version.
  *  5. Transform the client op against those server ops.
  *  6. Persist the *transformed* op with the new server version.
@@ -116,11 +117,17 @@ export async function handleOpSubmit(
     return
   }
 
+  // Set inside the lock when the client is detected to be ahead of the server.
+  // The reconnect payload is built AFTER the lock is released so that a slow
+  // or malicious client cannot block legitimate edits by holding the mutex
+  // across two DB round-trips.
+  let shouldReconnect = false
+
   try {
     // Step 3 — resolve the authoritative server version inside the lock.
     // This must happen before fetching ops so we can detect a "client ahead"
     // condition (clientVersion > currentVersion) which means the client has a
-    // version that doesn’t exist on the server yet — an impossible state under
+    // version that doesn't exist on the server yet — an impossible state under
     // normal operation that indicates the client is out of sync.
     let currentVersion = await getDocVersion(docId)
     if (currentVersion === null) {
@@ -131,80 +138,84 @@ export async function handleOpSubmit(
     }
 
     if (clientVersion > currentVersion) {
-      // Client claims to be ahead of the server — this should never happen in
-      // normal operation.  Force a reconnect so the client resets to the real
-      // server state rather than persisting a logically invalid op.
+      // Signal the post-lock path to send DOC_RECONNECT.  Do NOT call
+      // getDocument/getOperationsSince here — those DB queries must run
+      // outside the critical section so other writers can proceed.
       logger.warn(
         { docId, clientVersion, currentVersion },
         'op:submit: clientVersion ahead of server — forcing reconnect'
       )
-      const doc = await getDocument(docId)
-      const ops = doc ? await getOperationsSince(docId, doc.snapshotVersion) : []
-      socket.emit(WS.DOC_RECONNECT, {
-        snapshot: doc?.snapshotContent ?? '',
-        version: doc?.snapshotVersion ?? 0,
-        ops,
-      })
-      return
-    }
-
-    // Step 4 — fetch all operations applied since the client’s version.
-    const serverOps = await getOperationsSince(docId, clientVersion)
-
-    // Step 5 — transform the incoming op against every server op since clientVersion.
-    const transformedOp = transformAgainstServerOps(op, serverOps)
-
-    // Step 6 — persist the transformed op with the new server version.
-    const serverVersion = currentVersion + 1
-    await saveOperation(docId, socket.data.userId, transformedOp, serverVersion)
-
-    // Step 7 — update the version counter in Redis.
-    await setDocVersion(docId, serverVersion)
-
-    // Step 8 — acknowledge the sender.
-    // The op is durably persisted and the version counter is advanced, so we
-    // ack unconditionally here.  Broadcast can fail independently (see step 9)
-    // but the committed serverVersion must be returned to the client so it can
-    // update its local version and avoid retrying an already-applied op.
-    socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
-
-    // Step 9 — broadcast to all clients.
-    // Always emit to sockets on THIS node directly: reliable local delivery
-    // must not depend on the Redis subscription being healthy.  For cross-node
-    // fanout, publish via Redis pub/sub; the publisherId field lets other nodes
-    // broadcast to their own clients while this node's subscription callback
-    // ignores the echo and avoids double-emitting.
-    const broadcastPayload = {
-      op: transformedOp,
-      authorId: socket.data.userId,
-      serverVersion,
-      publisherId: NODE_ID,
-    }
-
-    // Local emit always happens unconditionally.
-    io.to(docId).emit(WS.OP_BROADCAST, broadcastPayload)
-
-    // Cross-node fanout via Redis.  A failure here means remote nodes miss
-    // this op until the affected clients reconnect, but local clients are
-    // already covered.  Log for alerting so ops-on-call can investigate.
-    try {
-      await publish(`doc:${docId}`, broadcastPayload)
-    } catch (pubErr) {
-      logger.error(
-        { pubErr, docId, serverVersion },
-        'op:submit: Redis publish failed — remote nodes will not receive this op'
+      shouldReconnect = true
+    } else if (currentVersion - clientVersion > env.OP_MAX_CATCHUP_OPS) {
+      // Client is too far behind the current server version.  Applying
+      // O(N) transforms while holding the lock would block all other writers
+      // on this document for the duration of two DB queries.  Force a full
+      // resync instead — the client will replay from the latest snapshot,
+      // which is never more than OP_MAX_CATCHUP_OPS ops old.
+      logger.warn(
+        { docId, clientVersion, currentVersion, gap: currentVersion - clientVersion },
+        'op:submit: client too far behind catch-up window — forcing reconnect'
       )
-    }
+      shouldReconnect = true
+    } else {
+      // Step 4 — fetch all operations applied since the client's version.
+      const serverOps = await getOperationsSince(docId, clientVersion)
 
-    // Snapshot optimisation: every 100 ops, compute and store a full document
-    // state to keep replay time bounded. Runs outside the lock window.
-    if (serverVersion % 100 === 0) {
-      setImmediate(() => {
-        void takeSnapshot(docId, serverVersion)
-      })
-    }
+      // Step 5 — transform the incoming op against every server op since clientVersion.
+      const transformedOp = transformAgainstServerOps(op, serverOps)
 
-    logger.debug({ docId, serverVersion, latencyMs: Date.now() - start }, 'op:submit processed')
+      // Step 6 — persist the transformed op with the new server version.
+      const serverVersion = currentVersion + 1
+      await saveOperation(docId, socket.data.userId, transformedOp, serverVersion)
+
+      // Step 7 — update the version counter in Redis.
+      await setDocVersion(docId, serverVersion)
+
+      // Step 8 — acknowledge the sender.
+      // The op is durably persisted and the version counter is advanced, so we
+      // ack unconditionally here.  Broadcast can fail independently (see step 9)
+      // but the committed serverVersion must be returned to the client so it can
+      // update its local version and avoid retrying an already-applied op.
+      socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
+
+      // Step 9 — broadcast to all clients.
+      // Always emit to sockets on THIS node directly: reliable local delivery
+      // must not depend on the Redis subscription being healthy.  For cross-node
+      // fanout, publish via Redis pub/sub; the publisherId field lets other nodes
+      // broadcast to their own clients while this node's subscription callback
+      // ignores the echo and avoids double-emitting.
+      const broadcastPayload = {
+        op: transformedOp,
+        authorId: socket.data.userId,
+        serverVersion,
+        publisherId: NODE_ID,
+      }
+
+      // Local emit always happens unconditionally.
+      io.to(docId).emit(WS.OP_BROADCAST, broadcastPayload)
+
+      // Cross-node fanout via Redis.  A failure here means remote nodes miss
+      // this op until the affected clients reconnect, but local clients are
+      // already covered.  Log for alerting so ops-on-call can investigate.
+      try {
+        await publish(`doc:${docId}`, broadcastPayload)
+      } catch (pubErr) {
+        logger.error(
+          { pubErr, docId, serverVersion },
+          'op:submit: Redis publish failed — remote nodes will not receive this op'
+        )
+      }
+
+      // Snapshot optimisation: every 100 ops, compute and store a full document
+      // state to keep replay time bounded. Runs outside the lock window.
+      if (serverVersion % 100 === 0) {
+        setImmediate(() => {
+          void takeSnapshot(docId, serverVersion)
+        })
+      }
+
+      logger.debug({ docId, serverVersion, latencyMs: Date.now() - start }, 'op:submit processed')
+    }
   } catch (err) {
     logger.error({ err, docId }, 'handleOpSubmit: error processing operation')
     socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to process operation' })
@@ -221,6 +232,24 @@ export async function handleOpSubmit(
         { releaseErr, lockKey, docId },
         'handleOpSubmit: releaseLock failed — lock may have expired'
       )
+    }
+  }
+
+  // Post-lock: build and send the reconnect payload now that the mutex is
+  // released.  Other writers on this document can proceed concurrently while
+  // this slow-path DB fetch runs.
+  if (shouldReconnect) {
+    try {
+      const doc = await getDocument(docId)
+      const ops = doc ? await getOperationsSince(docId, doc.snapshotVersion) : []
+      socket.emit(WS.DOC_RECONNECT, {
+        snapshot: doc?.snapshotContent ?? '',
+        version: doc?.snapshotVersion ?? 0,
+        ops,
+      })
+    } catch (err) {
+      logger.error({ err, docId }, 'handleOpSubmit: reconnect fetch failed')
+      socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to process operation' })
     }
   }
 }

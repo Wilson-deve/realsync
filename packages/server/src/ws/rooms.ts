@@ -160,8 +160,13 @@ export function registerHandlers(
     }
   })
 
-  // ── disconnect ─────────────────────────────────────────────────────────────
-  socket.on('disconnect', async () => {
+  // ── disconnecting ──────────────────────────────────────────────────────────
+  // Use 'disconnecting' (not 'disconnect') because by the time 'disconnect'
+  // fires Socket.io has already removed the socket from all of its rooms, so
+  // socket.rooms only contains the socket's own private room, making the
+  // room-iteration loop below a no-op and leaving stale entries in every
+  // doc-sessions:* set.  'disconnecting' fires while rooms are still intact.
+  socket.on('disconnecting', async () => {
     // Clean up every document room this socket was in.
     // Filter out the socket's own ID (Socket.io gives every socket a personal room).
     const rooms = Array.from(socket.rooms).filter((r) => r !== socket.id)
