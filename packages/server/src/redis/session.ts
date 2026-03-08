@@ -47,9 +47,11 @@ export interface SessionData {
  * Also registers the sessionId in the per-document set so
  * `getDocSessions()` can enumerate all active sessions for a document.
  *
- * All three commands are sent in a single pipeline (MULTI/EXEC) so a
- * mid-flight crash cannot leave the session key and the set membership
- * in an inconsistent state.
+ * All three commands are dispatched atomically via MULTI/EXEC — Redis will
+ * not interleave other clients' commands between them. Note: Redis does not
+ * roll back on per-command runtime errors; `assertExecResults` checks the
+ * per-command result array and throws if any command failed so the caller
+ * is aware of partial writes.
  */
 export async function setSession(sessionId: string, data: SessionData): Promise<void> {
   const key = `session:${sessionId}`
@@ -80,8 +82,10 @@ export async function getSession(sessionId: string): Promise<SessionData | null>
 }
 
 /** Remove a session and deregister it from its document's session set.
- * Both commands are sent in a single MULTI/EXEC pipeline so a crash between
- * them cannot leave the session key and set membership out of sync.
+ * Both commands are dispatched atomically via MULTI/EXEC — no other client's
+ * commands can interleave between them. Note: Redis does not roll back on
+ * per-command errors; `assertExecResults` checks the result array and throws
+ * if either command failed.
  */
 export async function deleteSession(sessionId: string, docId: string): Promise<void> {
   const results = await pubClient

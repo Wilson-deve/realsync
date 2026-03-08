@@ -62,13 +62,25 @@ export async function publish(channel: string, data: unknown): Promise<void> {
 }
 
 function buildUnsubscribe(channel: string, handler: MessageHandler): () => Promise<void> {
+  let called = false
   return async () => {
+    // Idempotent: a second call after the handler was already removed is a no-op.
+    if (called) return
+    called = true
+
     const handlers = channelHandlers.get(channel)
     if (!handlers) return
     handlers.delete(handler)
     if (handlers.size > 0) return
 
     // Last handler removed — send UNSUBSCRIBE to Redis.
+    // If an UNSUBSCRIBE is already in flight for this channel (e.g. concurrent
+    // last-handler removal), reuse that promise instead of issuing a new command.
+    if (pendingUnsubscribes.has(channel)) {
+      await pendingUnsubscribes.get(channel)
+      return
+    }
+
     // Keep the channelHandlers entry in place until the command succeeds so
     // that in-flight messages don't land in a channel with no record at all.
     // Only delete it once Redis confirms; on failure the entry is retained
