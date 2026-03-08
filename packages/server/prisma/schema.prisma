@@ -71,7 +71,6 @@ model Operation {
   timestamp  DateTime @default(now())
   document   Document @relation(fields: [docId], references: [id])
 
-  @@index([docId, version])
   @@unique([docId, version])
 }
 
