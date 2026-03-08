@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto'
 import { pubClient } from './client'
+import { logger } from '../utils/logger'
 
 const SESSION_TTL = 30 * 60 // 30 minutes in seconds
 
@@ -41,16 +42,33 @@ export async function setSession(sessionId: string, data: SessionData): Promise<
     .exec()
 }
 
-/** Read a session by ID. Returns `null` if the key has expired or never existed. */
+/** Read a session by ID. Returns `null` if the key has expired or never existed.
+ * If the stored value is not valid JSON (corrupted or schema mismatch), the key
+ * is deleted and `null` is returned rather than letting the error bubble up.
+ */
 export async function getSession(sessionId: string): Promise<SessionData | null> {
-  const raw = await pubClient.get(`session:${sessionId}`)
-  return raw ? (JSON.parse(raw) as SessionData) : null
+  const key = `session:${sessionId}`
+  const raw = await pubClient.get(key)
+  if (!raw) return null
+  try {
+    return JSON.parse(raw) as SessionData
+  } catch {
+    logger.warn({ sessionId }, 'Redis: corrupt session value — deleting key')
+    await pubClient.del(key)
+    return null
+  }
 }
 
-/** Remove a session and deregister it from its document's session set. */
+/** Remove a session and deregister it from its document's session set.
+ * Both commands are sent in a single MULTI/EXEC pipeline so a crash between
+ * them cannot leave the session key and set membership out of sync.
+ */
 export async function deleteSession(sessionId: string, docId: string): Promise<void> {
-  await pubClient.del(`session:${sessionId}`)
-  await pubClient.srem(`doc-sessions:${docId}`, sessionId)
+  await pubClient
+    .multi()
+    .del(`session:${sessionId}`)
+    .srem(`doc-sessions:${docId}`, sessionId)
+    .exec()
 }
 
 /**
@@ -59,8 +77,12 @@ export async function deleteSession(sessionId: string, docId: string): Promise<v
  */
 export async function getDocSessions(docId: string): Promise<SessionData[]> {
   const ids = await pubClient.smembers(`doc-sessions:${docId}`)
-  const sessions = await Promise.all(ids.map((id) => getSession(id)))
-  return sessions.filter((s): s is SessionData => s !== null)
+  const results = await Promise.all(ids.map(async (id) => ({ id, data: await getSession(id) })))
+  const stale = results.filter((r) => r.data === null).map((r) => r.id)
+  if (stale.length > 0) await pubClient.srem(`doc-sessions:${docId}`, ...stale)
+  return results
+    .filter((r): r is { id: string; data: SessionData } => r.data !== null)
+    .map((r) => r.data)
 }
 
 /** Return the current server-side version counter for a document. Defaults to 0. */

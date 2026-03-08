@@ -44,13 +44,19 @@ export async function publish(channel: string, data: unknown): Promise<void> {
  * Multiple handlers on the same channel share a single Redis subscription
  * and a single 'message' listener — no per-call listener is added.
  * Returns an unsubscribe function that removes this handler only.
+ * Throws if the underlying Redis SUBSCRIBE command fails.
  */
-export function subscribe(channel: string, handler: MessageHandler): () => void {
+export async function subscribe(channel: string, handler: MessageHandler): Promise<() => void> {
   if (!channelHandlers.has(channel)) {
     channelHandlers.set(channel, new Set())
-    subClient.subscribe(channel, (err) => {
-      if (err) throw new Error(`Redis subscribe error on channel ${channel}: ${err.message}`)
-    })
+    try {
+      await subClient.subscribe(channel)
+    } catch (err) {
+      channelHandlers.delete(channel)
+      throw new Error(
+        `Redis subscribe error on channel ${channel}: ${err instanceof Error ? err.message : String(err)}`
+      )
+    }
   }
 
   channelHandlers.get(channel)!.add(handler)
