@@ -61,14 +61,49 @@ export async function publish(channel: string, data: unknown): Promise<void> {
   await pubClient.publish(channel, JSON.stringify(data))
 }
 
+function buildUnsubscribe(channel: string, handler: MessageHandler): () => Promise<void> {
+  return async () => {
+    const handlers = channelHandlers.get(channel)
+    if (!handlers) return
+    handlers.delete(handler)
+    if (handlers.size > 0) return
+
+    // Last handler removed — send UNSUBSCRIBE to Redis.
+    // Keep the channelHandlers entry in place until the command succeeds so
+    // that in-flight messages don't land in a channel with no record at all.
+    // Only delete it once Redis confirms; on failure, log and leave the entry
+    // so the channel state stays consistent with Redis still being subscribed.
+    const pending: Promise<void> = subClient
+      .unsubscribe(channel)
+      .then(() => {
+        channelHandlers.delete(channel)
+      })
+      .catch((err: unknown) => {
+        logger.warn(
+          { channel, err: err instanceof Error ? err.message : String(err) },
+          'Redis: unsubscribe failed — channel entry retained to stay consistent with Redis'
+        )
+      })
+      .finally(() => {
+        pendingUnsubscribes.delete(channel)
+      })
+    pendingUnsubscribes.set(channel, pending)
+    await pending
+  }
+}
+
 /**
  * Subscribe to a Redis channel and invoke `handler` for each message.
  * Multiple handlers on the same channel share a single Redis subscription
  * and a single 'message' listener — no per-call listener is added.
- * Returns an unsubscribe function that removes this handler only.
+ * Returns an async unsubscribe function that removes this handler only.
+ * Await the unsubscribe function to confirm the Redis UNSUBSCRIBE completed.
  * Throws if the underlying Redis SUBSCRIBE command fails.
  */
-export async function subscribe(channel: string, handler: MessageHandler): Promise<() => void> {
+export async function subscribe(
+  channel: string,
+  handler: MessageHandler
+): Promise<() => Promise<void>> {
   // Drain any in-flight UNSUBSCRIBE first so we never send SUBSCRIBE while
   // Redis is still processing a prior UNSUBSCRIBE for the same channel.
   if (pendingUnsubscribes.has(channel)) {
@@ -80,14 +115,16 @@ export async function subscribe(channel: string, handler: MessageHandler): Promi
     // share the success or propagate the same failure.
     await pendingSubscribes.get(channel)
   } else if (!channelHandlers.has(channel)) {
-    // First subscriber for this channel: initiate the Redis SUBSCRIBE and
-    // record the in-flight promise so concurrent callers can join it.
-    const pending = subClient
+    // Create the handler Set and add this handler BEFORE issuing the SUBSCRIBE
+    // so no messages are dropped in the window between Redis confirming the
+    // subscription and the handler being registered. If SUBSCRIBE fails the
+    // handler and the Set are both cleaned up in the catch block.
+    channelHandlers.set(channel, new Set([handler]))
+    const pending: Promise<void> = subClient
       .subscribe(channel)
-      .then(() => {
-        channelHandlers.set(channel, new Set())
-      })
+      .then(() => undefined)
       .catch((err: unknown) => {
+        channelHandlers.delete(channel)
         throw new Error(
           `Redis subscribe error on channel ${channel}: ${err instanceof Error ? err.message : String(err)}`
         )
@@ -97,30 +134,12 @@ export async function subscribe(channel: string, handler: MessageHandler): Promi
       })
     pendingSubscribes.set(channel, pending)
     await pending
+    // Handler already added above — return the unsubscribe function directly.
+    return buildUnsubscribe(channel, handler)
   }
 
-  // Safe: channelHandlers entry is guaranteed to exist after await above.
+  // Existing subscription (or just joined an in-flight one): add handler now.
   channelHandlers.get(channel)!.add(handler)
 
-  return () => {
-    const handlers = channelHandlers.get(channel)
-    if (!handlers) return
-    handlers.delete(handler)
-    if (handlers.size === 0) {
-      channelHandlers.delete(channel)
-      const pending: Promise<void> = subClient
-        .unsubscribe(channel)
-        .then(() => undefined)
-        .catch((err: unknown) => {
-          logger.warn(
-            { channel, err: err instanceof Error ? err.message : String(err) },
-            'Redis: unsubscribe failed'
-          )
-        })
-        .finally(() => {
-          pendingUnsubscribes.delete(channel)
-        })
-      pendingUnsubscribes.set(channel, pending)
-    }
-  }
+  return buildUnsubscribe(channel, handler)
 }
