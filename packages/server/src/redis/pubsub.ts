@@ -67,7 +67,12 @@ export async function subscribe(channel: string, handler: MessageHandler): Promi
     handlers.delete(handler)
     if (handlers.size === 0) {
       channelHandlers.delete(channel)
-      subClient.unsubscribe(channel)
+      subClient.unsubscribe(channel).catch((err: unknown) => {
+        logger.warn(
+          { channel, err: err instanceof Error ? err.message : String(err) },
+          'Redis: unsubscribe failed'
+        )
+      })
     }
   }
 }

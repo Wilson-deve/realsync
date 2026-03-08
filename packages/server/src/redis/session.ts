@@ -4,6 +4,25 @@ import { logger } from '../utils/logger'
 
 const SESSION_TTL = 30 * 60 // 30 minutes in seconds
 
+/**
+ * Inspect the per-command results returned by ioredis `multi().exec()`.
+ * Each entry is a `[Error | null, unknown]` tuple — a non-null error means
+ * that specific command failed even though the transaction was sent.
+ * Throws an aggregated error if any command failed, or if the pipeline
+ * itself was aborted (exec returned null, e.g. after a WATCH conflict).
+ */
+function assertExecResults(results: Array<[Error | null, unknown]> | null, context: string): void {
+  if (results === null) {
+    throw new Error(`Redis MULTI/EXEC aborted (WATCH conflict) in ${context}`)
+  }
+  const failed = results
+    .map(([err], i) => (err ? `command[${i}]: ${err.message}` : null))
+    .filter((msg): msg is string => msg !== null)
+  if (failed.length > 0) {
+    throw new Error(`Redis MULTI/EXEC partial failure in ${context}: ${failed.join('; ')}`)
+  }
+}
+
 // Lua script: delete the key only when the stored value equals the caller's token.
 // Runs atomically inside Redis — no other command can execute between the GET and DEL.
 const RELEASE_LOCK_SCRIPT = `
@@ -34,12 +53,13 @@ export interface SessionData {
  */
 export async function setSession(sessionId: string, data: SessionData): Promise<void> {
   const key = `session:${sessionId}`
-  await pubClient
+  const results = await pubClient
     .multi()
     .set(key, JSON.stringify(data), 'EX', SESSION_TTL)
     .sadd(`doc-sessions:${data.docId}`, sessionId)
     .expire(`doc-sessions:${data.docId}`, SESSION_TTL)
     .exec()
+  assertExecResults(results, `setSession(${sessionId})`)
 }
 
 /** Read a session by ID. Returns `null` if the key has expired or never existed.
@@ -64,25 +84,50 @@ export async function getSession(sessionId: string): Promise<SessionData | null>
  * them cannot leave the session key and set membership out of sync.
  */
 export async function deleteSession(sessionId: string, docId: string): Promise<void> {
-  await pubClient
+  const results = await pubClient
     .multi()
     .del(`session:${sessionId}`)
     .srem(`doc-sessions:${docId}`, sessionId)
     .exec()
+  assertExecResults(results, `deleteSession(${sessionId})`)
 }
 
 /**
  * Return all live SessionData objects for a given document.
- * Expired sessions are silently filtered out (getSession returns null).
+ * Fetches all session keys in a single MGET round-trip instead of one GET
+ * per session. Expired/missing sessions (null values) are filtered out and
+ * their IDs are pruned from the doc-sessions set in one SREM call.
+ * Corrupt values are logged and treated as missing.
  */
 export async function getDocSessions(docId: string): Promise<SessionData[]> {
   const ids = await pubClient.smembers(`doc-sessions:${docId}`)
-  const results = await Promise.all(ids.map(async (id) => ({ id, data: await getSession(id) })))
-  const stale = results.filter((r) => r.data === null).map((r) => r.id)
+  if (ids.length === 0) return []
+
+  const keys = ids.map((id) => `session:${id}`)
+  const raws = await pubClient.mget(...keys)
+
+  const live: SessionData[] = []
+  const stale: string[] = []
+
+  for (let i = 0; i < ids.length; i++) {
+    const raw = raws[i]
+    if (!raw) {
+      stale.push(ids[i])
+      continue
+    }
+    try {
+      live.push(JSON.parse(raw) as SessionData)
+    } catch {
+      logger.warn(
+        { sessionId: ids[i] },
+        'Redis: corrupt session value in getDocSessions — skipping'
+      )
+      stale.push(ids[i])
+    }
+  }
+
   if (stale.length > 0) await pubClient.srem(`doc-sessions:${docId}`, ...stale)
-  return results
-    .filter((r): r is { id: string; data: SessionData } => r.data !== null)
-    .map((r) => r.data)
+  return live
 }
 
 /** Return the current server-side version counter for a document. Defaults to 0. */
@@ -99,18 +144,27 @@ export async function setDocVersion(docId: string, version: number): Promise<voi
 /**
  * Acquire a Redis-backed mutex with a spin-wait.
  * Returns a unique token that the caller MUST pass to `releaseLock`.
- * Throws if the lock cannot be acquired within `ttlMs` milliseconds.
+ *
+ * @param key             Redis key used as the mutex.
+ * @param lockTtlMs       How long the lock is held in Redis (PX expiry).
+ *                        Must be long enough for the critical section to finish.
+ * @param acquireTimeoutMs  Maximum time to spend waiting for the lock before
+ *                        throwing. Defaults to `lockTtlMs` when omitted.
  *
  * Safety: stores a random token as the lock value instead of a constant.
  * This lets `releaseLock` verify ownership before deleting, preventing a
  * slow holder from releasing a lock that has already expired and been
  * re-acquired by another worker.
  */
-export async function acquireLock(key: string, ttlMs: number): Promise<string> {
+export async function acquireLock(
+  key: string,
+  lockTtlMs: number,
+  acquireTimeoutMs: number = lockTtlMs
+): Promise<string> {
   const token = randomUUID()
-  const deadline = Date.now() + ttlMs
+  const deadline = Date.now() + acquireTimeoutMs
   while (Date.now() < deadline) {
-    const result = await pubClient.set(key, token, 'PX', ttlMs, 'NX')
+    const result = await pubClient.set(key, token, 'PX', lockTtlMs, 'NX')
     if (result === 'OK') return token
     await new Promise<void>((r) => setTimeout(r, 10)) // back-off 10 ms before retry
   }
@@ -121,7 +175,13 @@ export async function acquireLock(key: string, ttlMs: number): Promise<string> {
  * Release a Redis mutex acquired via `acquireLock`.
  * Uses a Lua script to atomically check the stored token before deleting,
  * so a holder whose TTL already expired cannot delete a new owner's lock.
+ * Logs a warning when the script returns 0 — meaning the lock either expired
+ * or was already taken by another holder — so the caller is aware it may have
+ * operated outside the critical section.
  */
 export async function releaseLock(key: string, token: string): Promise<void> {
-  await pubClient.eval(RELEASE_LOCK_SCRIPT, 1, key, token)
+  const released = await pubClient.eval(RELEASE_LOCK_SCRIPT, 1, key, token)
+  if (released !== 1) {
+    logger.warn({ key }, 'releaseLock: lock was not held (expired or token mismatch)')
+  }
 }

@@ -4,8 +4,8 @@ import type { Op } from '@realsync/ot-engine'
 import { prisma } from './client'
 
 /**
- * Cast a Prisma JsonValue (which includes null/undefined when the column is
- * nullable) back to the attributes shape used by Op types.
+ * Cast a Prisma JsonValue (which is null when the column holds DbNull/JsonNull)
+ * back to the attributes shape used by Op types.
  * Returns undefined when there are no attributes so the property is omitted
  * rather than set to null.
  */
@@ -51,16 +51,25 @@ export async function getOperationsSince(docId: string, sinceVersion: number): P
 
   return rows.map((row): Op => {
     if (row.type === 'INSERT') {
-      const op: Op = { type: 'insert', position: row.position, content: row.content ?? '' }
+      if (row.content === null) {
+        throw new Error(`Invariant violation: INSERT operation ${row.id} has null content`)
+      }
+      const op: Op = { type: 'insert', position: row.position, content: row.content }
       const attrs = parseAttributes(row.attributes)
       if (attrs !== undefined) op.attributes = attrs
       return op
     }
     if (row.type === 'DELETE') {
-      return { type: 'delete', position: row.position, length: row.length ?? 0 }
+      if (row.length === null) {
+        throw new Error(`Invariant violation: DELETE operation ${row.id} has null length`)
+      }
+      return { type: 'delete', position: row.position, length: row.length }
     }
     // RETAIN
-    const op: Op = { type: 'retain', length: row.length ?? 0 }
+    if (row.length === null) {
+      throw new Error(`Invariant violation: RETAIN operation ${row.id} has null length`)
+    }
+    const op: Op = { type: 'retain', length: row.length }
     const attrs = parseAttributes(row.attributes)
     if (attrs !== undefined) op.attributes = attrs
     return op
