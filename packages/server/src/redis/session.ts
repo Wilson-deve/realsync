@@ -139,10 +139,16 @@ export async function getDocSessions(docId: string): Promise<SessionData[]> {
   return live
 }
 
-/** Return the current server-side version counter for a document. Defaults to 0. */
-export async function getDocVersion(docId: string): Promise<number> {
+/**
+ * Return the current server-side version counter for a document.
+ * Returns `null` when the Redis key is absent (never set or evicted after a
+ * restart) so callers can distinguish that from an explicit version=0.
+ * Returns a parsed integer when the key exists.
+ * Throws if the stored value is not a valid non-negative integer.
+ */
+export async function getDocVersion(docId: string): Promise<number | null> {
   const v = await pubClient.get(`doc-version:${docId}`)
-  if (!v) return 0
+  if (v === null) return null
   if (!/^\d+$/.test(v)) {
     throw new Error(`Corrupt doc-version for ${docId}: stored value "${v}" is not a valid integer`)
   }

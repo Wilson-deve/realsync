@@ -24,7 +24,7 @@ export interface ServerToClientEvents {
   'op:ack': (payload: { serverVersion: number; timestamp: number }) => void
   'op:broadcast': (payload: unknown) => void
   'presence:update': (payload: { users: SessionData[] }) => void
-  'doc:reconnect': (payload: { snapshot: string; version: number }) => void
+  'doc:reconnect': (payload: { snapshot: string; version: number; ops: unknown[] }) => void
   error: (payload: { code: string; message: string }) => void
 }
 

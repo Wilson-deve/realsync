@@ -40,12 +40,40 @@ export async function saveOperation(docId: string, userId: string, op: Op, versi
 }
 
 /**
+ * Returns the highest version number persisted for a document, or 0 if no
+ * operations have been stored yet.  Used to re-seed the Redis version counter
+ * after a restart or cache eviction so it never falls behind the DB state.
+ */
+export async function getMaxOperationVersion(docId: string): Promise<number> {
+  const result = await prisma.operation.aggregate({
+    where: { docId },
+    _max: { version: true },
+  })
+  return result._max.version ?? 0
+}
+
+/**
  * Returns all operations on `docId` with version > `sinceVersion`,
  * ordered ascending — ready to be replayed in sequence.
+ *
+ * @param upToVersion  When provided, only operations with version <=
+ *                     upToVersion are included. Use this in snapshot replay
+ *                     to avoid incorporating ops written after the snapshot
+ *                     was scheduled but before it ran.
  */
-export async function getOperationsSince(docId: string, sinceVersion: number): Promise<Op[]> {
+export async function getOperationsSince(
+  docId: string,
+  sinceVersion: number,
+  upToVersion?: number
+): Promise<Op[]> {
   const rows = await prisma.operation.findMany({
-    where: { docId, version: { gt: sinceVersion } },
+    where: {
+      docId,
+      version: {
+        gt: sinceVersion,
+        ...(upToVersion !== undefined ? { lte: upToVersion } : {}),
+      },
+    },
     orderBy: [{ version: 'asc' }, { id: 'asc' }],
   })
 

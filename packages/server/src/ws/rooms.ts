@@ -3,6 +3,7 @@ import { WS } from './events'
 import type { ServerToClientEvents, ClientToServerEvents } from './events'
 import { setSession, deleteSession, getDocSessions } from '../redis/session'
 import { getDocument } from '../db/documents'
+import { getOperationsSince } from '../db/operations'
 import { handleOpSubmit } from './handlers/op.handler'
 import { handleCursorUpdate } from './handlers/cursor.handler'
 import { handlePresencePing } from './handlers/presence.handler'
@@ -55,6 +56,33 @@ export function registerHandlers(
         return
       }
 
+      // Authorisation: the document must belong to the user's workspace.
+      // Without this check, any authenticated user who knows a docId can join
+      // documents from other workspaces and read or write their content.
+      if (doc.workspaceId !== socket.data.workspaceId) {
+        socket.emit(WS.ERROR, { code: 'FORBIDDEN', message: `Document ${docId} not found` })
+        return
+      }
+
+      // One-doc-per-socket enforcement:
+      // Session storage is keyed only by socket.id, so joining a second
+      // document would overwrite the single session record while leaving a
+      // stale entry in the previous doc's session set.  Auto-leave any
+      // existing document room before joining the new one.
+      const existingDocRooms = Array.from(socket.rooms).filter(
+        (r) => r !== socket.id && r !== docId
+      )
+      for (const prevDocId of existingDocRooms) {
+        try {
+          socket.leave(prevDocId)
+          await deleteSession(socket.id, prevDocId)
+          const prevSessions = await getDocSessions(prevDocId)
+          io.to(prevDocId).emit(WS.PRESENCE_UPDATE, { users: prevSessions })
+        } catch (err) {
+          logger.warn({ err, prevDocId, socketId: socket.id }, 'room:join: auto-leave failed')
+        }
+      }
+
       socket.join(docId)
 
       await setSession(socket.id, {
@@ -66,10 +94,16 @@ export function registerHandlers(
         lastSeen: Date.now(),
       })
 
-      // Send current document state to the joining client (handles reconnects too).
+      // Send the snapshot plus every op applied since it was taken.
+      // Snapshots are only written every 100 ops, so a joining client must
+      // replay `opsSinceSnapshot` on top of the snapshot to reach current state.
+      // Without this, clients joining between snapshots would receive a stale
+      // document with no way to catch up.
+      const opsSinceSnapshot = await getOperationsSince(docId, doc.snapshotVersion)
       socket.emit(WS.DOC_RECONNECT, {
         snapshot: doc.snapshotContent,
         version: doc.snapshotVersion,
+        ops: opsSinceSnapshot,
       })
 
       // Broadcast updated presence list to everyone in the room.

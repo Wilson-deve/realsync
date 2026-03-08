@@ -26,15 +26,22 @@ export async function takeSnapshot(docId: string, serverVersion: number): Promis
       return
     }
 
-    // Replay all operations that were applied after the last stored snapshot.
-    const ops = await getOperationsSince(docId, doc.snapshotVersion)
+    // Replay only the operations that were applied up to and including
+    // `serverVersion`. Without the upper bound, ops written after this snapshot
+    // job was scheduled (but before it runs) would be included, producing
+    // document content for a later version while the snapshot is persisted
+    // under `serverVersion` — mismatching content and version.
+    const ops = await getOperationsSince(docId, doc.snapshotVersion, serverVersion)
     let state: DocumentState = { content: doc.snapshotContent, version: doc.snapshotVersion }
     for (const op of ops) {
       state = apply(state, op)
     }
 
-    await updateSnapshot(docId, state.content, serverVersion)
-    logger.debug({ docId, serverVersion }, 'takeSnapshot: snapshot updated')
+    // Persist using state.version (the version of the last replayed op) rather
+    // than the raw serverVersion argument. If no ops were in range they are
+    // identical; if they diverge, state.version is the ground truth.
+    await updateSnapshot(docId, state.content, state.version)
+    logger.debug({ docId, snapshotVersion: state.version }, 'takeSnapshot: snapshot updated')
   } catch (err) {
     logger.error({ docId, serverVersion, err }, 'takeSnapshot: failed — snapshot skipped')
   }

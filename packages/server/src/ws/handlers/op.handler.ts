@@ -2,7 +2,7 @@ import type { Server, Socket } from 'socket.io'
 import type { Op } from '@realsync/ot-engine'
 import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
-import { getOperationsSince, saveOperation } from '../../db/operations'
+import { getOperationsSince, saveOperation, getMaxOperationVersion } from '../../db/operations'
 import { publish } from '../../redis/pubsub'
 import { acquireLock, releaseLock, getDocVersion, setDocVersion } from '../../redis/session'
 import { transformAgainstServerOps } from '../../ot/server-ot'
@@ -94,9 +94,17 @@ export async function handleOpSubmit(
     // Step 4 — transform the incoming op against every server op since clientVersion.
     const transformedOp = transformAgainstServerOps(op, serverOps)
 
-    // Step 5 — persist the TRANSFORMED op (not the original).
-    // The stored log must be replayable to rebuild the document.
-    const currentVersion = await getDocVersion(docId)
+    // Step 5 — resolve the current version, initializing from DB if the Redis
+    // key is absent (server restart or cache eviction).  Without this, after
+    // eviction getDocVersion would return null → we would compute serverVersion=1
+    // and saveOperation would violate the @@unique([docId, version]) constraint.
+    let currentVersion = await getDocVersion(docId)
+    if (currentVersion === null) {
+      // Key missing: seed Redis from the highest version already in Postgres.
+      currentVersion = await getMaxOperationVersion(docId)
+      await setDocVersion(docId, currentVersion)
+      logger.info({ docId, currentVersion }, 'op:submit: seeded Redis version counter from DB')
+    }
     const serverVersion = currentVersion + 1
     await saveOperation(docId, socket.data.userId, transformedOp, serverVersion)
 
@@ -128,7 +136,18 @@ export async function handleOpSubmit(
     logger.error({ err, docId }, 'handleOpSubmit: error processing operation')
     socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to process operation' })
   } finally {
-    // ALWAYS release the lock — a leaked lock freezes editing for this document.
-    await releaseLock(lockKey, lockToken!)
+    // ALWAYS attempt to release the lock — a leaked lock freezes editing for
+    // this document. Wrap in try/catch so a Redis network error here does not
+    // become an unhandled rejection: the caller invokes this handler
+    // fire-and-forget (void ...), so any rejection escaping the finally block
+    // would not be caught and could crash the process.
+    try {
+      await releaseLock(lockKey, lockToken!)
+    } catch (releaseErr) {
+      logger.error(
+        { releaseErr, lockKey, docId },
+        'handleOpSubmit: releaseLock failed — lock may have expired'
+      )
+    }
   }
 }

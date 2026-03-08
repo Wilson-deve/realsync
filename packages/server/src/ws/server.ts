@@ -76,14 +76,24 @@ export function createWebSocketServer(httpServer: HttpServer): Server {
       return next(new Error('AUTH_REQUIRED'))
     }
     try {
-      const payload = jwt.verify(token, env.JWT_SECRET) as {
-        userId: string
-        workspaceId: string
-        name?: string
+      const decoded = jwt.verify(token, env.JWT_SECRET)
+
+      // jwt.verify() can return a string (for non-object JWTs) or an object
+      // that is missing the claims we require. Cast only after explicit runtime
+      // validation so socket.data is never populated with undefined fields.
+      if (
+        typeof decoded !== 'object' ||
+        decoded === null ||
+        typeof (decoded as Record<string, unknown>).userId !== 'string' ||
+        typeof (decoded as Record<string, unknown>).workspaceId !== 'string'
+      ) {
+        return next(new Error('AUTH_INVALID'))
       }
+
+      const payload = decoded as { userId: string; workspaceId: string; name?: string }
       socket.data.userId = payload.userId
       socket.data.workspaceId = payload.workspaceId
-      if (payload.name) socket.data.name = payload.name
+      if (typeof payload.name === 'string') socket.data.name = payload.name
       next()
     } catch {
       next(new Error('AUTH_INVALID'))

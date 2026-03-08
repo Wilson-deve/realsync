@@ -24,7 +24,7 @@ async function main(): Promise<void> {
   })
 
   const httpServer = createServer(app)
-  createWebSocketServer(httpServer)
+  const io = createWebSocketServer(httpServer)
 
   httpServer.listen(env.PORT, () => {
     logger.info({ port: env.PORT }, 'RealSync server running...')
@@ -33,7 +33,16 @@ async function main(): Promise<void> {
   // ── Graceful shutdown ──────────────────────────────────────────────────────
   async function shutdown(signal: string): Promise<void> {
     logger.info({ signal }, 'Shutting down gracefully…')
-    httpServer.close()
+
+    // Close the Socket.io server first — stops accepting new WS connections
+    // and waits for existing sockets to disconnect.
+    await new Promise<void>((resolve) => io.close(() => resolve()))
+
+    // Stop the HTTP server and wait for in-flight requests to finish.
+    await new Promise<void>((resolve, reject) =>
+      httpServer.close((err) => (err ? reject(err) : resolve()))
+    )
+
     await Promise.allSettled([prisma.$disconnect(), pubClient.quit(), subClient.quit()])
     logger.info('Shutdown complete')
     process.exit(0)

@@ -41,6 +41,18 @@ export async function handleCursorUpdate(
     const session = await getSession(socket.id)
     if (!session) return
 
+    // Guard: the session's recorded docId must match the payload docId, and
+    // the socket must actually be in that Socket.io room.  Without this, a
+    // client could supply an arbitrary docId and trigger presence broadcasts
+    // into rooms it has never joined, or corrupt another document's presence.
+    if (session.docId !== docId || !socket.rooms.has(docId)) {
+      logger.warn(
+        { socketId: socket.id, sessionDocId: session.docId, payloadDocId: docId },
+        'cursor:update: docId mismatch or socket not in room — ignoring'
+      )
+      return
+    }
+
     await setSession(socket.id, { ...session, cursor, lastSeen: Date.now() })
     const sessions = await getDocSessions(docId)
     io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })

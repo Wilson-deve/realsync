@@ -36,6 +36,16 @@ export async function handlePresencePing(
     const session = await getSession(socket.id)
     if (!session) return
 
+    // Same guard as cursor:update: reject pings that claim a docId the socket
+    // hasn't actually joined to prevent cross-room presence broadcasts.
+    if (session.docId !== docId || !socket.rooms.has(docId)) {
+      logger.warn(
+        { socketId: socket.id, sessionDocId: session.docId, payloadDocId: docId },
+        'presence:ping: docId mismatch or socket not in room — ignoring'
+      )
+      return
+    }
+
     await setSession(socket.id, { ...session, lastSeen: Date.now() })
     const sessions = await getDocSessions(docId)
     io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })
