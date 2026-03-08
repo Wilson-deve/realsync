@@ -74,7 +74,7 @@ export function registerHandlers(
       )
       for (const prevDocId of existingDocRooms) {
         try {
-          socket.leave(prevDocId)
+          await socket.leave(prevDocId)
           await deleteSession(socket.id, prevDocId)
           const prevSessions = await getDocSessions(prevDocId)
           io.to(prevDocId).emit(WS.PRESENCE_UPDATE, { users: prevSessions })
@@ -83,7 +83,7 @@ export function registerHandlers(
         }
       }
 
-      socket.join(docId)
+      await socket.join(docId)
 
       await setSession(socket.id, {
         userId: socket.data.userId,
@@ -137,7 +137,7 @@ export function registerHandlers(
         return
       }
 
-      socket.leave(docId)
+      await socket.leave(docId)
       await deleteSession(socket.id, docId)
       const sessions = await getDocSessions(docId)
       io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })

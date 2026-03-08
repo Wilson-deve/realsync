@@ -63,9 +63,16 @@ function setupCrossNodeBroadcast(io: Server): void {
  * Create and configure the Socket.io server.
  *
  * Authentication: every connection must supply a JWT via the Socket.io
- * `auth` payload (`socket = io(url, { auth: { token } })`).  The token is
- * intentionally NOT read from the URL query string, which is commonly logged
- * by proxies, CDNs, and access logs, risking credential leakage.
+ * `auth` payload (`socket = io(url, { auth: { token } })`).  This is the
+ * preferred transport because `auth` is never part of the HTTP request URL
+ * and therefore does not appear in proxy, CDN, or access logs.
+ *
+ * For backwards compatibility during client migration, `handshake.query.token`
+ * is also accepted as a fallback.  Once all clients have been updated to pass
+ * `auth.token`, the query-string fallback should be removed to eliminate the
+ * risk of credential leakage via URL logging.
+ *
+ * TODO: remove `handshake.query.token` fallback once client migration is complete.
  *
  * After authentication, `socket.data` is populated with `userId`,
  * `workspaceId`, and optionally `name` from the token payload.
