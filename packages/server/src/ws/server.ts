@@ -2,6 +2,7 @@ import { Server } from 'socket.io'
 import type { Server as HttpServer } from 'http'
 import jwt from 'jsonwebtoken'
 import { env } from '../config/env'
+import { NODE_ID } from '../config/node-id'
 import { subscribe } from '../redis/pubsub'
 import { registerHandlers } from './rooms'
 import { WS } from './events'
@@ -36,13 +37,25 @@ function setupCrossNodeBroadcast(io: Server): void {
     if (roomState.has(room)) return // subscribe already in flight or completed
 
     const pending = subscribe(`doc:${room}`, (data: unknown) => {
+      // Skip messages published by this node — it already emitted to its local
+      // sockets directly in handleOpSubmit.  Without this guard, every op
+      // would be emitted twice to clients on the publishing node.
+      if (
+        typeof data === 'object' &&
+        data !== null &&
+        (data as Record<string, unknown>).publisherId === NODE_ID
+      ) {
+        return
+      }
       io.to(room).emit(WS.OP_BROADCAST, data)
     }).catch((err: unknown) => {
       // Subscribe failed — remove the entry so a future join can retry.
       roomState.delete(room)
       logger.error({ err, room }, 'Redis subscribe failed — cross-node broadcast disabled for room')
       // Return a no-op unsubscribe so the Promise type is consistent.
-      return async () => { /* no-op */ }
+      return async () => {
+        /* no-op */
+      }
     })
 
     roomState.set(room, pending)

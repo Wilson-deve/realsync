@@ -13,6 +13,12 @@ const envSchema = z.object({
   CORS_ORIGIN: z.string().default('http://localhost:5173'),
   API_KEY_PREFIX: z.string().default('rs_live_'),
   WEBHOOK_SECRET: z.string().optional(),
+  // Maximum time (ms) the per-document OT lock is held before it auto-expires.
+  // Must be long enough to cover DB reads/writes + Redis publish under load.
+  // Keeping this well above the p99 critical-section latency prevents a slow
+  // node from releasing a lock that has already been re-acquired by another
+  // worker and reintroducing version collisions.
+  OP_LOCK_TTL_MS: z.coerce.number().int().positive().default(30_000),
 })
 
 const result = envSchema.safeParse(process.env)

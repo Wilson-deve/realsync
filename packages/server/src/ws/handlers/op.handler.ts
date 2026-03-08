@@ -12,10 +12,12 @@ import {
   setDocVersion,
   getSession,
 } from '../../redis/session'
-import { transformAgainstServerOps } from '../../ot/server-ot'
-import { takeSnapshot } from '../../ot/snapshot'
 import { logger } from '../../utils/logger'
 import type { SocketData } from '../server'
+import { NODE_ID } from '../../config/node-id'
+import { transformAgainstServerOps } from '../../ot/server-ot'
+import { takeSnapshot } from '../../ot/snapshot'
+import { env } from '../../config/env'
 
 interface OpSubmitPayload {
   docId: string
@@ -108,7 +110,7 @@ export async function handleOpSubmit(
   // both think they are version=6, and we get a version collision.
   let lockToken: string
   try {
-    lockToken = await acquireLock(lockKey, 5000, 3000)
+    lockToken = await acquireLock(lockKey, env.OP_LOCK_TTL_MS, 3000)
   } catch {
     socket.emit(WS.ERROR, { code: 'LOCK_TIMEOUT', message: 'Server is busy — please retry' })
     return
@@ -166,24 +168,32 @@ export async function handleOpSubmit(
     // update its local version and avoid retrying an already-applied op.
     socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
 
-    // Step 9 — broadcast to all clients via Redis pub/sub.
-    // If publish() fails (transient Redis error), fall back to a local
-    // io.to(docId).emit so clients on THIS node still receive the op.
-    // Clients on other nodes will catch up via doc:reconnect on their next
-    // connection.  The publish failure is logged for alerting.
+    // Step 9 — broadcast to all clients.
+    // Always emit to sockets on THIS node directly: reliable local delivery
+    // must not depend on the Redis subscription being healthy.  For cross-node
+    // fanout, publish via Redis pub/sub; the publisherId field lets other nodes
+    // broadcast to their own clients while this node's subscription callback
+    // ignores the echo and avoids double-emitting.
     const broadcastPayload = {
       op: transformedOp,
       authorId: socket.data.userId,
       serverVersion,
+      publisherId: NODE_ID,
     }
+
+    // Local emit always happens unconditionally.
+    io.to(docId).emit(WS.OP_BROADCAST, broadcastPayload)
+
+    // Cross-node fanout via Redis.  A failure here means remote nodes miss
+    // this op until the affected clients reconnect, but local clients are
+    // already covered.  Log for alerting so ops-on-call can investigate.
     try {
       await publish(`doc:${docId}`, broadcastPayload)
     } catch (pubErr) {
       logger.error(
         { pubErr, docId, serverVersion },
-        'op:submit: Redis publish failed — falling back to local broadcast'
+        'op:submit: Redis publish failed — remote nodes will not receive this op'
       )
-      io.to(docId).emit(WS.OP_BROADCAST, broadcastPayload)
     }
 
     // Snapshot optimisation: every 100 ops, compute and store a full document

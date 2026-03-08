@@ -128,16 +128,30 @@ export function registerHandlers(
     const { docId } = payload as { docId: string }
 
     try {
-      const session = await getSession(socket.id)
-      if (!session || session.docId !== docId || !socket.rooms.has(docId)) {
+      // The Socket.io room membership is the authoritative source: if the
+      // socket is not in the room there is nothing to leave.
+      if (!socket.rooms.has(docId)) {
         logger.warn(
-          { socketId: socket.id, sessionDocId: session?.docId, payloadDocId: docId },
-          'room:leave: docId mismatch or socket not in room — ignoring'
+          { socketId: socket.id, payloadDocId: docId },
+          'room:leave: socket not in room — ignoring'
+        )
+        return
+      }
+
+      // If the session exists, also guard against a docId mismatch (a client
+      // claiming to leave a doc that doesn't match its active session).
+      const session = await getSession(socket.id)
+      if (session && session.docId !== docId) {
+        logger.warn(
+          { socketId: socket.id, sessionDocId: session.docId, payloadDocId: docId },
+          'room:leave: docId mismatch — ignoring'
         )
         return
       }
 
       await socket.leave(docId)
+      // Best-effort: delete the session even if getSession returned null
+      // (TTL expiry / eviction while the socket was still connected).
       await deleteSession(socket.id, docId)
       const sessions = await getDocSessions(docId)
       io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })
