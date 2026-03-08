@@ -133,7 +133,12 @@ export async function getDocSessions(docId: string): Promise<SessionData[]> {
 /** Return the current server-side version counter for a document. Defaults to 0. */
 export async function getDocVersion(docId: string): Promise<number> {
   const v = await pubClient.get(`doc-version:${docId}`)
-  return v ? parseInt(v, 10) : 0
+  if (!v) return 0
+  const n = parseInt(v, 10)
+  if (!Number.isFinite(n)) {
+    throw new Error(`Corrupt doc-version for ${docId}: stored value "${v}" is not a valid integer`)
+  }
+  return n
 }
 
 /** Persist the current version counter for a document. */

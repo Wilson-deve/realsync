@@ -15,6 +15,21 @@ type MessageHandler = (data: unknown) => void
  */
 const channelHandlers = new Map<string, Set<MessageHandler>>()
 
+/**
+ * In-flight SUBSCRIBE promises, keyed by channel.
+ * Concurrent subscribe() calls for the same channel all await the same
+ * promise so they either all succeed or all receive the same error.
+ * The entry is removed once the SUBSCRIBE settles.
+ */
+const pendingSubscribes = new Map<string, Promise<void>>()
+
+/**
+ * In-flight UNSUBSCRIBE promises, keyed by channel.
+ * A new subscribe() for a channel drains any pending UNSUBSCRIBE first so
+ * the old fire-and-forget can't race ahead and undo the new subscription.
+ */
+const pendingUnsubscribes = new Map<string, Promise<void>>()
+
 subClient.on('message', (channel, message) => {
   const handlers = channelHandlers.get(channel)
   if (!handlers) return
@@ -47,18 +62,37 @@ export async function publish(channel: string, data: unknown): Promise<void> {
  * Throws if the underlying Redis SUBSCRIBE command fails.
  */
 export async function subscribe(channel: string, handler: MessageHandler): Promise<() => void> {
-  if (!channelHandlers.has(channel)) {
-    channelHandlers.set(channel, new Set())
-    try {
-      await subClient.subscribe(channel)
-    } catch (err) {
-      channelHandlers.delete(channel)
-      throw new Error(
-        `Redis subscribe error on channel ${channel}: ${err instanceof Error ? err.message : String(err)}`
-      )
-    }
+  // Drain any in-flight UNSUBSCRIBE first so we never send SUBSCRIBE while
+  // Redis is still processing a prior UNSUBSCRIBE for the same channel.
+  if (pendingUnsubscribes.has(channel)) {
+    await pendingUnsubscribes.get(channel)
   }
 
+  if (pendingSubscribes.has(channel)) {
+    // Another caller is mid-SUBSCRIBE for this channel — await it so we either
+    // share the success or propagate the same failure.
+    await pendingSubscribes.get(channel)
+  } else if (!channelHandlers.has(channel)) {
+    // First subscriber for this channel: initiate the Redis SUBSCRIBE and
+    // record the in-flight promise so concurrent callers can join it.
+    const pending = subClient
+      .subscribe(channel)
+      .then(() => {
+        channelHandlers.set(channel, new Set())
+      })
+      .catch((err: unknown) => {
+        throw new Error(
+          `Redis subscribe error on channel ${channel}: ${err instanceof Error ? err.message : String(err)}`
+        )
+      })
+      .finally(() => {
+        pendingSubscribes.delete(channel)
+      })
+    pendingSubscribes.set(channel, pending)
+    await pending
+  }
+
+  // Safe: channelHandlers entry is guaranteed to exist after await above.
   channelHandlers.get(channel)!.add(handler)
 
   return () => {
@@ -67,12 +101,19 @@ export async function subscribe(channel: string, handler: MessageHandler): Promi
     handlers.delete(handler)
     if (handlers.size === 0) {
       channelHandlers.delete(channel)
-      subClient.unsubscribe(channel).catch((err: unknown) => {
-        logger.warn(
-          { channel, err: err instanceof Error ? err.message : String(err) },
-          'Redis: unsubscribe failed'
-        )
-      })
+      const pending: Promise<void> = subClient
+        .unsubscribe(channel)
+        .then(() => undefined)
+        .catch((err: unknown) => {
+          logger.warn(
+            { channel, err: err instanceof Error ? err.message : String(err) },
+            'Redis: unsubscribe failed'
+          )
+        })
+        .finally(() => {
+          pendingUnsubscribes.delete(channel)
+        })
+      pendingUnsubscribes.set(channel, pending)
     }
   }
 }
