@@ -12,6 +12,7 @@ export const WS = {
   // Server → Client
   OP_ACK: 'op:ack',
   OP_BROADCAST: 'op:broadcast',
+  CURSOR_BROADCAST: 'cursor:broadcast',
   PRESENCE_UPDATE: 'presence:update',
   DOC_RECONNECT: 'doc:reconnect',
   ERROR: 'error',
@@ -23,6 +24,13 @@ export const WS = {
 export interface ServerToClientEvents {
   'op:ack': (payload: { serverVersion: number; timestamp: number }) => void
   'op:broadcast': (payload: unknown) => void
+  /** Delta update: a single user's cursor moved. Cheaper than a full presence:update. */
+  'cursor:broadcast': (payload: {
+    userId: string
+    name: string
+    color: string
+    cursor: number
+  }) => void
   'presence:update': (payload: { users: SessionData[] }) => void
   'doc:reconnect': (payload: { snapshot: string; version: number; ops: unknown[] }) => void
   error: (payload: { code: string; message: string }) => void

@@ -1,7 +1,7 @@
 import type { Server, Socket } from 'socket.io'
 import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
-import { getSession, setSession, getDocSessions } from '../../redis/session'
+import { getSession, setSession } from '../../redis/session'
 import { logger } from '../../utils/logger'
 import type { SocketData } from '../server'
 
@@ -13,9 +13,15 @@ interface CursorUpdatePayload {
 /**
  * Handle a `cursor:update` event from a connected client.
  *
- * Validates the payload, updates the sender's cursor position in the Redis
- * session store, then broadcasts the full presence list to everyone in the
- * document room so all clients see up-to-date cursor positions.
+ * Validates the payload, persists the new cursor position in the Redis session
+ * store, then broadcasts a lightweight delta (`cursor:broadcast`) containing
+ * only the fields that changed for the one user.  This avoids refetching the
+ * full presence list from Redis and re-serialising all N sessions on every
+ * keystroke, which would become a significant Redis + network hotspot at scale.
+ *
+ * Clients should apply the delta to their local presence map rather than
+ * replacing the whole list.  A full `presence:update` is still sent by
+ * room:join / presence:ping / disconnect to keep the authoritative list in sync.
  */
 export async function handleCursorUpdate(
   io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
@@ -57,8 +63,15 @@ export async function handleCursorUpdate(
     }
 
     await setSession(socket.id, { ...session, cursor, lastSeen: Date.now() })
-    const sessions = await getDocSessions(docId)
-    io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })
+    // Emit a single-user delta instead of refetching and broadcasting the full
+    // session list.  Presence:update (full list) is still emitted on join/leave
+    // and presence:ping so clients always have a reconciliation path.
+    io.to(docId).emit(WS.CURSOR_BROADCAST, {
+      userId: session.userId,
+      name: session.name,
+      color: session.color,
+      cursor,
+    })
   } catch (err) {
     logger.error({ err, docId }, 'handleCursorUpdate: failed')
     socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to update cursor' })

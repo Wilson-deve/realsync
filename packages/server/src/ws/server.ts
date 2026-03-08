@@ -2,7 +2,7 @@ import { Server } from 'socket.io'
 import type { Server as HttpServer } from 'http'
 import jwt from 'jsonwebtoken'
 import { env } from '../config/env'
-import { subClient } from '../redis/client'
+import { subscribe } from '../redis/pubsub'
 import { registerHandlers } from './rooms'
 import { WS } from './events'
 import type { ServerToClientEvents, ClientToServerEvents } from './events'
@@ -16,58 +16,46 @@ export interface SocketData {
 }
 
 /**
- * Receive operation broadcasts from all other server nodes and forward
- * them to the correct Socket.io room on THIS node.
+ * Subscribe to a document's Redis channel when the first local socket joins
+ * and unsubscribe when the last local socket leaves.  Uses the pubsub.ts
+ * helpers so subscriptions are deduplicated and race-free.
  *
- * Server A publishes `doc:{docId}` → Redis → Server B's psubscribe handler
- * calls `io.to(docId).emit(OP_BROADCAST, ...)` → clients on B receive the op.
- *
- * Uses `subClient.psubscribe` (pattern subscription) directly because the
- * pubsub.ts abstraction only handles exact-channel subscriptions.
+ * Server A publishes `doc:{docId}` → Redis → Server B's handler calls
+ * `io.to(docId).emit(OP_BROADCAST, ...)` → clients on B receive the op.
  */
 function setupCrossNodeBroadcast(io: Server): void {
-  // Deliver incoming Redis messages to the correct local room.
-  // Uses exact-channel `subscribe` (not psubscribe) so only channels this node
-  // has actively subscribed to are processed.
-  subClient.on('message', (channel: string, message: string) => {
-    const docId = channel.startsWith('doc:') ? channel.slice(4) : null
-    if (!docId) return
-    try {
-      const data: unknown = JSON.parse(message)
-      io.to(docId).emit(WS.OP_BROADCAST, data)
-    } catch {
-      logger.warn({ channel }, 'Redis: received malformed message — ignoring')
-    }
-  })
+  // Track per-doc unsubscribe functions returned by pubsub.subscribe().
+  const unsubscribeFns = new Map<string, () => Promise<void>>()
 
   // Subscribe when the FIRST local socket joins a doc room, unsubscribe when
-  // the LAST local socket leaves.  This replaces the previous psubscribe('doc:*')
-  // which received and JSON-parsed every op cluster-wide regardless of whether
-  // any client on this node was interested in that document.
-  //
-  // Socket.io gives every socket a personal room named after its socket.id;
-  // skip those by checking room === id.
+  // the LAST local socket leaves.  Socket.io gives every socket a personal
+  // room named after its socket.id; skip those by checking room === id.
   io.of('/').adapter.on('join-room', (room: string, id: string) => {
     if (room === id) return
-    const localSize = io.sockets.adapter.rooms.get(room)?.size ?? 0
-    if (localSize === 1) {
-      subClient.subscribe(`doc:${room}`, (err) => {
-        if (err)
-          logger.error(
-            { err, room },
-            'Redis subscribe failed — cross-node broadcast disabled for room'
-          )
+    if (unsubscribeFns.has(room)) return // already subscribed for this room
+    subscribe(`doc:${room}`, (data: unknown) => {
+      io.to(room).emit(WS.OP_BROADCAST, data)
+    })
+      .then((unsub) => {
+        unsubscribeFns.set(room, unsub)
       })
-    }
+      .catch((err: unknown) => {
+        logger.error(
+          { err, room },
+          'Redis subscribe failed — cross-node broadcast disabled for room'
+        )
+      })
   })
 
   io.of('/').adapter.on('leave-room', (room: string, id: string) => {
     if (room === id) return
-    if (!io.sockets.adapter.rooms.get(room)) {
-      subClient.unsubscribe(`doc:${room}`, (err) => {
-        if (err) logger.warn({ err, room }, 'Redis unsubscribe failed')
-      })
-    }
+    if (io.sockets.adapter.rooms.get(room)) return // other sockets still in the room
+    const unsub = unsubscribeFns.get(room)
+    if (!unsub) return
+    unsubscribeFns.delete(room)
+    unsub().catch((err: unknown) => {
+      logger.warn({ err, room }, 'Redis unsubscribe failed')
+    })
   })
 }
 

@@ -20,7 +20,6 @@ interface OpSubmitPayload {
   docId: string
   op: Op
   clientVersion: number
-  sessionId: string
 }
 
 function isNonNegativeInteger(n: unknown): boolean {
@@ -75,12 +74,12 @@ export async function handleOpSubmit(
     typeof payload !== 'object' ||
     payload === null ||
     typeof (payload as Record<string, unknown>).docId !== 'string' ||
-    typeof (payload as Record<string, unknown>).clientVersion !== 'number' ||
+    !isNonNegativeInteger((payload as Record<string, unknown>).clientVersion) ||
     !isValidOp((payload as Record<string, unknown>).op)
   ) {
     socket.emit(WS.ERROR, {
       code: 'INVALID_PAYLOAD',
-      message: 'op:submit requires docId, op, and clientVersion',
+      message: 'op:submit requires docId, a non-negative integer clientVersion, and a valid op',
     })
     return
   }
