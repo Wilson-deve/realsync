@@ -108,6 +108,7 @@ export async function getDocSessions(docId: string): Promise<SessionData[]> {
 
   const live: SessionData[] = []
   const stale: string[] = []
+  const corrupt: string[] = []
 
   for (let i = 0; i < ids.length; i++) {
     const raw = raws[i]
@@ -120,13 +121,17 @@ export async function getDocSessions(docId: string): Promise<SessionData[]> {
     } catch {
       logger.warn(
         { sessionId: ids[i] },
-        'Redis: corrupt session value in getDocSessions — skipping'
+        'Redis: corrupt session value in getDocSessions — deleting key'
       )
+      corrupt.push(ids[i])
       stale.push(ids[i])
     }
   }
 
-  if (stale.length > 0) await pubClient.srem(`doc-sessions:${docId}`, ...stale)
+  const cleanups: Promise<unknown>[] = []
+  if (stale.length > 0) cleanups.push(pubClient.srem(`doc-sessions:${docId}`, ...stale))
+  if (corrupt.length > 0) cleanups.push(pubClient.del(...corrupt.map((id) => `session:${id}`)))
+  if (cleanups.length > 0) await Promise.all(cleanups)
   return live
 }
 
@@ -176,7 +181,7 @@ export async function acquireLock(
     const cap = 500
     const base = 10
     const ceiling = Math.min(cap, base * 2 ** attempt)
-    const delay = Math.floor(Math.random() * ceiling)
+    const delay = Math.max(1, Math.floor(Math.random() * ceiling))
     await new Promise<void>((r) => setTimeout(r, delay))
     attempt++
   }

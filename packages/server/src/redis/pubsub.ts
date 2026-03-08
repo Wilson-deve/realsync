@@ -71,18 +71,21 @@ function buildUnsubscribe(channel: string, handler: MessageHandler): () => Promi
     // Last handler removed — send UNSUBSCRIBE to Redis.
     // Keep the channelHandlers entry in place until the command succeeds so
     // that in-flight messages don't land in a channel with no record at all.
-    // Only delete it once Redis confirms; on failure, log and leave the entry
-    // so the channel state stays consistent with Redis still being subscribed.
+    // Only delete it once Redis confirms; on failure the entry is retained
+    // (Redis is still subscribed) and the error is rethrown so the caller
+    // knows the UNSUBSCRIBE did not complete.
     const pending: Promise<void> = subClient
       .unsubscribe(channel)
       .then(() => {
         channelHandlers.delete(channel)
       })
       .catch((err: unknown) => {
+        const message = err instanceof Error ? err.message : String(err)
         logger.warn(
-          { channel, err: err instanceof Error ? err.message : String(err) },
+          { channel, err: message },
           'Redis: unsubscribe failed — channel entry retained to stay consistent with Redis'
         )
+        throw new Error(`Redis unsubscribe failed for channel ${channel}: ${message}`)
       })
       .finally(() => {
         pendingUnsubscribes.delete(channel)
