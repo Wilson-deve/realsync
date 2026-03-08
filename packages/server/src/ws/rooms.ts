@@ -1,7 +1,7 @@
 import type { Server, Socket } from 'socket.io'
 import { WS } from './events'
 import type { ServerToClientEvents, ClientToServerEvents } from './events'
-import { setSession, deleteSession, getDocSessions } from '../redis/session'
+import { getSession, setSession, deleteSession, getDocSessions } from '../redis/session'
 import { getDocument } from '../db/documents'
 import { getOperationsSince } from '../db/operations'
 import { handleOpSubmit } from './handlers/op.handler'
@@ -128,6 +128,15 @@ export function registerHandlers(
     const { docId } = payload as { docId: string }
 
     try {
+      const session = await getSession(socket.id)
+      if (!session || session.docId !== docId || !socket.rooms.has(docId)) {
+        logger.warn(
+          { socketId: socket.id, sessionDocId: session?.docId, payloadDocId: docId },
+          'room:leave: docId mismatch or socket not in room — ignoring'
+        )
+        return
+      }
+
       socket.leave(docId)
       await deleteSession(socket.id, docId)
       const sessions = await getDocSessions(docId)

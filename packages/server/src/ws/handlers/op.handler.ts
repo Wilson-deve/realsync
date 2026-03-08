@@ -4,7 +4,7 @@ import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
 import { getOperationsSince, saveOperation, getMaxOperationVersion } from '../../db/operations'
 import { publish } from '../../redis/pubsub'
-import { acquireLock, releaseLock, getDocVersion, setDocVersion } from '../../redis/session'
+import { acquireLock, releaseLock, getDocVersion, setDocVersion, getSession } from '../../redis/session'
 import { transformAgainstServerOps } from '../../ot/server-ot'
 import { takeSnapshot } from '../../ot/snapshot'
 import { logger } from '../../utils/logger'
@@ -75,6 +75,15 @@ export async function handleOpSubmit(
   const lockKey = `lock:doc:${docId}`
   const start = Date.now()
 
+  // Authorisation guard: reject ops from sockets that haven't joined the room.
+  // A socket must complete room:join (which validates workspace ownership) before
+  // submitting ops — this prevents arbitrary document writes via a known docId.
+  const session = await getSession(socket.id)
+  if (!session || session.docId !== docId || !socket.rooms.has(docId)) {
+    socket.emit(WS.ERROR, { code: 'FORBIDDEN', message: 'Join the document room before submitting operations' })
+    return
+  }
+
   // Step 2 — acquire per-document lock.
   // Only one op can be processed for a given document at a time.
   // Without this lock, two concurrent ops might both read version=5,
@@ -111,10 +120,10 @@ export async function handleOpSubmit(
     // Step 6 — update the version counter in Redis.
     await setDocVersion(docId, serverVersion)
 
-    // Step 7 — acknowledge back to the sender.
-    socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
-
-    // Step 8 — broadcast to all other clients via Redis pub/sub.
+    // Step 7 — broadcast to all clients via Redis pub/sub, then ack the sender.
+    // The ack is intentionally sent AFTER publish so that a publish failure
+    // does not leave the sender believing the op was applied while no node
+    // has actually broadcast it to other connected clients.
     // Publishing to Redis ensures ALL server nodes receive the message
     // and forward it to their connected clients in the same room.
     await publish(`doc:${docId}`, {
@@ -122,6 +131,10 @@ export async function handleOpSubmit(
       authorId: socket.data.userId,
       serverVersion,
     })
+
+    // Step 8 — acknowledge back to the sender now that the op is persisted
+    // AND visible to every server node.
+    socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
 
     // Snapshot optimisation: every 100 ops, compute and store a full document
     // state to keep replay time bounded. Runs outside the lock window.
