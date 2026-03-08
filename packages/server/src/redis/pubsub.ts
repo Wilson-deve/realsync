@@ -45,10 +45,7 @@ subClient.on('message', (channel, message) => {
     try {
       handler(parsed)
     } catch (err) {
-      logger.warn(
-        { channel, err: err instanceof Error ? err.message : String(err) },
-        'Redis: message handler threw — skipping'
-      )
+      logger.warn({ channel, err }, 'Redis: message handler threw — skipping')
     }
   }
 })

@@ -72,6 +72,7 @@ model Operation {
   document   Document @relation(fields: [docId], references: [id])
 
   @@index([docId, version])
+  @@unique([docId, version])
 }
 
 model User {

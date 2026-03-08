@@ -46,7 +46,7 @@ export async function saveOperation(docId: string, userId: string, op: Op, versi
 export async function getOperationsSince(docId: string, sinceVersion: number): Promise<Op[]> {
   const rows = await prisma.operation.findMany({
     where: { docId, version: { gt: sinceVersion } },
-    orderBy: { version: 'asc' },
+    orderBy: [{ version: 'asc' }, { id: 'asc' }],
   })
 
   return rows.map((row): Op => {

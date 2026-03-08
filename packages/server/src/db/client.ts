@@ -14,6 +14,8 @@ export const prisma =
     log: env.NODE_ENV === 'development' ? ['query', 'error'] : ['error'],
   })
 
-if (env.NODE_ENV !== 'production') {
+// Cache on global only in development to survive hot reloads.
+// In test each module load gets a fresh client to prevent cross-test leakage.
+if (env.NODE_ENV === 'development') {
   global.__prisma = prisma
 }
