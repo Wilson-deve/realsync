@@ -7,18 +7,15 @@ import { env } from './config/env'
 import { logger } from './utils/logger'
 
 async function main(): Promise<void> {
-  // Connect to Redis before starting the server so pub/sub is ready immediately.
   await connectRedis()
   logger.info('Redis connected')
 
-  // Verify the database connection is healthy on startup.
   await prisma.$connect()
   logger.info('PostgreSQL connected')
 
   const app = express()
   app.use(express.json())
 
-  /** Health check — used by load balancers and Docker HEALTHCHECK. */
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', version: process.env['npm_package_version'] ?? '0.1.0' })
   })
@@ -30,12 +27,6 @@ async function main(): Promise<void> {
     logger.info({ port: env.PORT }, 'RealSync server running...')
   })
 
-  // ── Graceful shutdown ──────────────────────────────────────────────────────
-  // A single shared promise ensures shutdown is idempotent: a second signal
-  // (e.g. SIGINT followed by SIGTERM) simply awaits the in-progress sequence
-  // rather than launching a second concurrent shutdown that would race
-  // io.close() / httpServer.close() and produce confusing double-logs or
-  // double-rejections.
   let shutdownPromise: Promise<void> | null = null
 
   function shutdown(signal: string): Promise<void> {
@@ -47,13 +38,16 @@ async function main(): Promise<void> {
     shutdownPromise = (async () => {
       logger.info({ signal }, 'Shutting down gracefully…')
 
-      // Close the Socket.io server first — stops accepting new WS connections
-      // and waits for existing sockets to disconnect.
       await new Promise<void>((resolve) => io.close(() => resolve()))
 
-      // Stop the HTTP server and wait for in-flight requests to finish.
       await new Promise<void>((resolve, reject) =>
-        httpServer.close((err) => (err ? reject(err) : resolve()))
+        httpServer.close((err) => {
+          if (!err || (err as NodeJS.ErrnoException).code === 'ERR_SERVER_NOT_RUNNING') {
+            resolve()
+          } else {
+            reject(err)
+          }
+        })
       )
 
       await Promise.allSettled([prisma.$disconnect(), pubClient.quit(), subClient.quit()])
