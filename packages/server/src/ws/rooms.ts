@@ -89,24 +89,30 @@ export function registerHandlers(
         }
       }
 
-      // Capture the current server version BEFORE joining the Socket.io room.
-      // This is the version ceiling that bounds the initial sync payload.
+      // Join the room FIRST so no broadcast can be missed, then capture the
+      // version ceiling as the deduplication boundary.
       //
-      // Why the order matters:
-      //   socket.join(docId) makes the socket eligible to receive op:broadcast
-      //   from Redis pub/sub immediately.  If we read ops AFTER joining, any op
-      //   committed between the DB read and the join is forwarded as a broadcast
-      //   AND included in the ops array — a duplicate.  By capturing the version
-      //   ceiling first, then joining, then fetching ops up to that ceiling:
-      //     - ops in doc:reconnect are bounded to <= syncedVersion
-      //     - any op:broadcast arriving after join has serverVersion > syncedVersion
-      //     - the client applies broadcasts only above the boundary — no duplicates
+      // Correct ordering:
+      //   1. socket.join(docId)  — socket is now in the room; every subsequent
+      //      op:broadcast is queued / delivered to this socket.
+      //   2. Capture syncedVersion — any op committed AFTER this point will be
+      //      broadcast AND have serverVersion > syncedVersion.
+      //   3. Fetch ops up to syncedVersion — the array covers  everything up to
+      //      the boundary; no gap, no overlap with future broadcasts.
+      //   4. Emit doc:reconnect with syncedVersion — the client discards any
+      //      buffered broadcast whose serverVersion <= syncedVersion (already in
+      //      ops) and applies broadcasts with serverVersion > syncedVersion on top.
+      //
+      // Previous (wrong) order  — capture version, then join — had a gap:
+      //   an op committed between the read and the join was broadcast before the
+      //   socket was in the room (missed) AND excluded from the ops array
+      //   (payload was bounded to the old ceiling) → permanent data loss.
+      await socket.join(docId)
+
       let syncedVersion = await getDocVersion(docId)
       if (syncedVersion === null) {
         syncedVersion = await getMaxOperationVersion(docId)
       }
-
-      await socket.join(docId)
 
       await setSession(socket.id, {
         userId: socket.data.userId,
