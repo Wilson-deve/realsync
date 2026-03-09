@@ -37,11 +37,20 @@ export async function takeSnapshot(docId: string, serverVersion: number): Promis
       state = apply(state, op)
     }
 
-    // Persist using state.version (the version of the last replayed op) rather
-    // than the raw serverVersion argument. If no ops were in range they are
-    // identical; if they diverge, state.version is the ground truth.
-    await updateSnapshot(docId, state.content, state.version)
-    logger.debug({ docId, snapshotVersion: state.version }, 'takeSnapshot: snapshot updated')
+    // Persist only if this version is newer than whatever is currently stored.
+    // takeSnapshot() jobs run via setImmediate and can complete out of order;
+    // updateSnapshot() uses a snapshotVersion < newVersion guard so a stale
+    // job arriving late matches zero rows and does nothing rather than
+    // regressing the snapshot.
+    const updated = await updateSnapshot(docId, state.content, state.version)
+    if (updated === 0) {
+      logger.debug(
+        { docId, snapshotVersion: state.version },
+        'takeSnapshot: skipped — a newer snapshot already exists'
+      )
+    } else {
+      logger.debug({ docId, snapshotVersion: state.version }, 'takeSnapshot: snapshot updated')
+    }
   } catch (err) {
     logger.error({ docId, serverVersion, err }, 'takeSnapshot: failed — snapshot skipped')
   }

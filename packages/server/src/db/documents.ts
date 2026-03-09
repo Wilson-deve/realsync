@@ -21,13 +21,24 @@ export async function getDocument(docId: string) {
 }
 
 /**
- * Update the denormalised snapshot fields on a document.
- * Called by the OT handler after each successfully applied operation
- * to keep an up-to-date content cache without replaying all operations.
+ * Conditionally advance the denormalised snapshot fields on a document.
+ *
+ * Uses `updateMany` with a `snapshotVersion < version` guard so the write is
+ * monotonic: a slower earlier snapshot job that finishes out of order will
+ * match zero rows and silently no-op instead of overwriting a newer snapshot.
+ * This prevents snapshotVersion/content regressions when concurrent
+ * setImmediate snapshot jobs complete in arbitrary order.
+ *
+ * Returns the number of rows updated (0 or 1).
  */
-export async function updateSnapshot(docId: string, content: string, version: number) {
-  return prisma.document.update({
-    where: { id: docId },
+export async function updateSnapshot(
+  docId: string,
+  content: string,
+  version: number
+): Promise<number> {
+  const result = await prisma.document.updateMany({
+    where: { id: docId, snapshotVersion: { lt: version } },
     data: { snapshotContent: content, snapshotVersion: version },
   })
+  return result.count
 }
