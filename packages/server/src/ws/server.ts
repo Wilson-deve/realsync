@@ -48,17 +48,24 @@ function setupCrossNodeBroadcast(io: Server): void {
         return
       }
       io.to(room).emit(WS.OP_BROADCAST, data)
-    }).catch((err: unknown) => {
-      // Subscribe failed — remove the entry so a future join can retry.
-      roomState.delete(room)
-      logger.error({ err, room }, 'Redis subscribe failed — cross-node broadcast disabled for room')
-      // Return a no-op unsubscribe so the Promise type is consistent.
-      return async () => {
-        /* no-op */
-      }
     })
 
+    // Store the raw subscribe() promise immediately so that any concurrent
+    // join-room events see the entry and skip — preventing duplicate Redis
+    // SUBSCRIBE calls for the same room.
     roomState.set(room, pending)
+
+    // Register a cleanup handler separately from the value stored in the Map.
+    // If subscribe() rejects, remove the entry so the next join-room event
+    // can attempt a fresh subscribe.  We do NOT chain this catch onto `pending`
+    // before inserting it into the Map: chaining would replace the stored value
+    // with a promise that resolves to a no-op function on failure, making the
+    // Map entry permanently non-retriable (the no-op would survive any future
+    // leave-room clean-up and the entry would never be re-inserted).
+    pending.catch((err: unknown) => {
+      roomState.delete(room)
+      logger.error({ err, room }, 'Redis subscribe failed — cross-node broadcast disabled for room')
+    })
   })
 
   io.of('/').adapter.on('leave-room', (room: string, id: string) => {

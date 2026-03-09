@@ -7,6 +7,7 @@ import {
   deleteSession,
   getDocSessions,
   getDocVersion,
+  setDocVersion,
 } from '../redis/session'
 import { getDocument } from '../db/documents'
 import { getOperationsSince, getMaxOperationVersion } from '../db/operations'
@@ -112,6 +113,12 @@ export function registerHandlers(
       let syncedVersion = await getDocVersion(docId)
       if (syncedVersion === null) {
         syncedVersion = await getMaxOperationVersion(docId)
+        // Persist the seeded version back to Redis so subsequent joins on this
+        // node (or others, if using a shared Redis) read O(1) instead of
+        // re-running the DB MAX aggregate on every join after a restart or
+        // Redis eviction.  The NX flag ensures we don't race-overwrite a newer
+        // version that handleOpSubmit may have written concurrently.
+        await setDocVersion(docId, syncedVersion, /* nx */ true)
       }
 
       await setSession(socket.id, {
@@ -145,6 +152,22 @@ export function registerHandlers(
     } catch (err) {
       logger.error({ err, docId }, 'room:join failed')
       socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to join document' })
+
+      // If socket.join(docId) already ran before the failure, the socket is
+      // sitting in the room without a valid session.  This would keep
+      // cross-node Redis subscriptions alive and deliver spurious broadcasts
+      // until the client disconnects.  Best-effort rollback:
+      if (socket.rooms.has(docId)) {
+        try {
+          await socket.leave(docId)
+          await deleteSession(socket.id, docId)
+          // Re-broadcast presence so the failed joiner is not shown to others.
+          const sessions = await getDocSessions(docId)
+          io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })
+        } catch (cleanupErr) {
+          logger.warn({ cleanupErr, docId, socketId: socket.id }, 'room:join rollback failed')
+        }
+      }
     }
   })
 

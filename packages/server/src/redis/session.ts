@@ -155,9 +155,19 @@ export async function getDocVersion(docId: string): Promise<number | null> {
   return Number(v)
 }
 
-/** Persist the current version counter for a document. */
-export async function setDocVersion(docId: string, version: number): Promise<void> {
-  await pubClient.set(`doc-version:${docId}`, version.toString())
+/**
+ * Persist the current version counter for a document.
+ *
+ * @param nx  When true, uses SET NX (only write if the key does not already
+ *            exist).  Use this when seeding from the DB to avoid overwriting
+ *            a version that handleOpSubmit may have written concurrently.
+ */
+export async function setDocVersion(docId: string, version: number, nx = false): Promise<void> {
+  if (nx) {
+    await pubClient.set(`doc-version:${docId}`, version.toString(), 'NX')
+  } else {
+    await pubClient.set(`doc-version:${docId}`, version.toString())
+  }
 }
 
 /**
