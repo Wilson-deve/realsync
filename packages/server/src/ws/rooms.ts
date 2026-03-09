@@ -206,15 +206,31 @@ export function registerHandlers(
         return
       }
 
-      // If the session exists, also guard against a docId mismatch (a client
-      // claiming to leave a doc that doesn't match its active session).
+      // If the session exists and its docId doesn't match the payload, the
+      // state is inconsistent — but the socket IS in the room and will keep
+      // receiving broadcasts until it leaves.  Log the mismatch for
+      // investigation and fall through to leave + cleanup anyway: the room
+      // membership in Socket.io is the authoritative state that must be
+      // corrected regardless of what Redis says.
       const session = await getSession(socket.id)
       if (session && session.docId !== docId) {
         logger.warn(
           { socketId: socket.id, sessionDocId: session.docId, payloadDocId: docId },
-          'room:leave: docId mismatch — ignoring'
+          'room:leave: session docId mismatch — leaving room and cleaning up both docIds'
         )
-        return
+        // Also clean up whichever docId the session points to, since that
+        // room's presence set may have a stale entry for this socket.
+        try {
+          await socket.leave(session.docId)
+          await deleteSession(socket.id, session.docId)
+          const mismatchSessions = await getDocSessions(session.docId)
+          io.to(session.docId).emit(WS.PRESENCE_UPDATE, { users: mismatchSessions })
+        } catch (mismatchErr) {
+          logger.warn(
+            { mismatchErr, sessionDocId: session.docId, socketId: socket.id },
+            'room:leave: cleanup of mismatched session docId failed'
+          )
+        }
       }
 
       await socket.leave(docId)
