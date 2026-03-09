@@ -1,4 +1,4 @@
-﻿import type { Server, Socket } from 'socket.io'
+import type { Server, Socket } from 'socket.io'
 import type { Op } from '@realsync/ot-engine'
 import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
@@ -117,11 +117,17 @@ export async function handleOpSubmit(
     return
   }
 
-  // Set inside the lock when the client is detected to be ahead of the server.
-  // The reconnect payload is built AFTER the lock is released so that a slow
-  // or malicious client cannot block legitimate edits by holding the mutex
-  // across two DB round-trips.
+  // Flags/values set inside the lock and consumed after it is released.
+  // Keeping emit/publish/broadcast outside the critical section means the
+  // lock is held only for the minimum necessary work: version resolution,
+  // transform, persist, and version-counter advance (steps 3–7).  ACK and
+  // broadcast (steps 8–9) are pure I/O that do not need mutual exclusion.
   let shouldReconnect = false
+  let pendingAck: {
+    serverVersion: number
+    transformedOp: Op
+    authorId: string
+  } | null = null
 
   try {
     // Step 3 — resolve the authoritative server version inside the lock.
@@ -171,50 +177,10 @@ export async function handleOpSubmit(
       // Step 7 — update the version counter in Redis.
       await setDocVersion(docId, serverVersion)
 
-      // Step 8 — acknowledge the sender.
-      // The op is durably persisted and the version counter is advanced, so we
-      // ack unconditionally here.  Broadcast can fail independently (see step 9)
-      // but the committed serverVersion must be returned to the client so it can
-      // update its local version and avoid retrying an already-applied op.
-      socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
-
-      // Step 9 — broadcast to all clients.
-      // Always emit to sockets on THIS node directly: reliable local delivery
-      // must not depend on the Redis subscription being healthy.  For cross-node
-      // fanout, publish via Redis pub/sub; the publisherId field lets other nodes
-      // broadcast to their own clients while this node's subscription callback
-      // ignores the echo and avoids double-emitting.
-      const broadcastPayload = {
-        op: transformedOp,
-        authorId: socket.data.userId,
-        serverVersion,
-        publisherId: NODE_ID,
-      }
-
-      // Local emit always happens unconditionally.
-      io.to(docId).emit(WS.OP_BROADCAST, broadcastPayload)
-
-      // Cross-node fanout via Redis.  A failure here means remote nodes miss
-      // this op until the affected clients reconnect, but local clients are
-      // already covered.  Log for alerting so ops-on-call can investigate.
-      try {
-        await publish(`doc:${docId}`, broadcastPayload)
-      } catch (pubErr) {
-        logger.error(
-          { pubErr, docId, serverVersion },
-          'op:submit: Redis publish failed — remote nodes will not receive this op'
-        )
-      }
-
-      // Snapshot optimisation: every 100 ops, compute and store a full document
-      // state to keep replay time bounded. Runs outside the lock window.
-      if (serverVersion % 100 === 0) {
-        setImmediate(() => {
-          void takeSnapshot(docId, serverVersion)
-        })
-      }
-
-      logger.debug({ docId, serverVersion, latencyMs: Date.now() - start }, 'op:submit processed')
+      // Critical section ends here.  Capture what the post-lock path needs;
+      // steps 8–9 (ACK + broadcast) run after the lock is released so that
+      // other writers can acquire the mutex immediately.
+      pendingAck = { serverVersion, transformedOp, authorId: socket.data.userId }
     }
   } catch (err) {
     logger.error({ err, docId }, 'handleOpSubmit: error processing operation')
@@ -233,6 +199,55 @@ export async function handleOpSubmit(
         'handleOpSubmit: releaseLock failed — lock may have expired'
       )
     }
+  }
+
+  // Steps 8–9 — ACK + broadcast, now outside the critical section.
+  // The op is durably persisted and the version counter is advanced, so the
+  // lock is no longer needed.  Releasing it before these I/O calls lets other
+  // writers acquire the mutex immediately instead of waiting for network I/O.
+  if (pendingAck !== null) {
+    const { serverVersion, transformedOp, authorId } = pendingAck
+
+    // Step 8 — acknowledge the sender.
+    socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
+
+    // Step 9 — broadcast to all clients.
+    // Always emit to sockets on THIS node directly: reliable local delivery
+    // must not depend on the Redis subscription being healthy.  For cross-node
+    // fanout, publish via Redis pub/sub; the publisherId field lets other nodes
+    // broadcast to their own clients while this node's subscription callback
+    // ignores the echo and avoids double-emitting.
+    const broadcastPayload = {
+      op: transformedOp,
+      authorId,
+      serverVersion,
+      publisherId: NODE_ID,
+    }
+
+    // Local emit always happens unconditionally.
+    io.to(docId).emit(WS.OP_BROADCAST, broadcastPayload)
+
+    // Cross-node fanout via Redis.  A failure here means remote nodes miss
+    // this op until the affected clients reconnect, but local clients are
+    // already covered.  Log for alerting so ops-on-call can investigate.
+    try {
+      await publish(`doc:${docId}`, broadcastPayload)
+    } catch (pubErr) {
+      logger.error(
+        { pubErr, docId, serverVersion },
+        'op:submit: Redis publish failed — remote nodes will not receive this op'
+      )
+    }
+
+    // Snapshot optimisation: every 100 ops, compute and store a full document
+    // state to keep replay time bounded.
+    if (serverVersion % 100 === 0) {
+      setImmediate(() => {
+        void takeSnapshot(docId, serverVersion)
+      })
+    }
+
+    logger.debug({ docId, serverVersion, latencyMs: Date.now() - start }, 'op:submit processed')
   }
 
   // Post-lock: build and send the reconnect payload now that the mutex is

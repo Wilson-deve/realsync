@@ -119,7 +119,15 @@ export function createWebSocketServer(
   io.use((socket, next) => {
     // Prefer handshake.auth.token (not visible in URLs / proxy logs).
     // Accept handshake.query.token as a fallback only to aid migration.
-    const authToken = (socket.handshake.auth as Record<string, unknown>).token
+    // Guard auth first: Socket.io types it as `object` but it can arrive as
+    // undefined/null when the client connects without an auth payload.
+    // Casting without this check would throw before next() can be called,
+    // turning a missing credential into an unhandled exception.
+    const auth =
+      typeof socket.handshake.auth === 'object' && socket.handshake.auth !== null
+        ? (socket.handshake.auth as Record<string, unknown>)
+        : {}
+    const authToken = auth.token
     const queryRaw = socket.handshake.query.token
     const raw = authToken ?? (Array.isArray(queryRaw) ? queryRaw[0] : queryRaw)
     const token = typeof raw === 'string' ? raw : undefined
