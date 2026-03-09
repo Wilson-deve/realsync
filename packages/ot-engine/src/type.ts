@@ -15,10 +15,7 @@ export interface DeleteOp {
   type: 'delete'
   position: number
   length: number
-  /**
-   * Populated by `apply()` when the op is applied to a document.
-   * Required by `invert()` to reconstruct the inverse insert operation.
-   */
+  /** Populated by apply(), required by invert() to reconstruct original text. */
   deletedContent?: string
 }
 
@@ -36,8 +33,5 @@ export interface DocumentState {
   version: number
 }
 
-/**
- * Maps clientId → last sequence number seen from that client.
- * Used by the server to detect out-of-order or duplicate op submissions.
- */
+/** Maps clientId to last sequence number seen for duplicate detection. */
 export type VectorClock = Record<string, number>
