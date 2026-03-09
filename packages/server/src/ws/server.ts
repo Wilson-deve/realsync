@@ -55,8 +55,9 @@ function setupCrossNodeBroadcast(io: Server): void {
   io.of('/').adapter.on('join-room', (room: string, id: string) => {
     if (room === id) return
 
-    // op:broadcast channel
-    if (!opRoomState.has(room)) {
+    // op:broadcast channel — guard uses the channel string, matching the key
+    // used by subscribeRoom (map.set(channel, ...)) to prevent duplicates.
+    if (!opRoomState.has(`doc:${room}`)) {
       subscribeRoom(opRoomState, `doc:${room}`, (data: unknown) => {
         // Skip messages published by this node — it already emitted to its local
         // sockets directly in handleOpSubmit.  Without this guard, every op
@@ -72,10 +73,10 @@ function setupCrossNodeBroadcast(io: Server): void {
       })
     }
 
-    // cursor:broadcast channel — mirrors op fanout so clients on other nodes
-    // receive real-time cursor deltas without waiting for presence:update.
-    if (!cursorRoomState.has(room)) {
-      subscribeRoom(cursorRoomState, `cursor:${room}`, (data: unknown) => {
+    // presence:{docId} channel (cursor + user state, per pubsub.ts convention)
+    // — same dedup pattern.
+    if (!cursorRoomState.has(`presence:${room}`)) {
+      subscribeRoom(cursorRoomState, `presence:${room}`, (data: unknown) => {
         if (
           typeof data === 'object' &&
           data !== null &&
@@ -95,7 +96,7 @@ function setupCrossNodeBroadcast(io: Server): void {
     // Unsubscribe both channels when the last socket leaves the room.
     for (const [map, channel] of [
       [opRoomState, `doc:${room}`],
-      [cursorRoomState, `cursor:${room}`],
+      [cursorRoomState, `presence:${room}`],
     ] as [Map<string, Promise<() => Promise<void>>>, string][]) {
       const pending = map.get(channel)
       if (!pending) continue

@@ -78,13 +78,14 @@ export async function handleCursorUpdate(
     // depend on the Redis subscription being healthy.
     io.to(docId).emit(WS.CURSOR_BROADCAST, broadcastPayload)
 
-    // Cross-node fanout: publish to the cursor:{docId} channel so other server
-    // nodes can re-emit to their local sockets.  Without this, clients on other
-    // nodes only see cursor changes via the next full presence:update broadcast.
+    // Cross-node fanout: publish to the presence:{docId} channel (the established
+    // convention in pubsub.ts for cursor + user state) so other server nodes can
+    // re-emit to their local sockets.  Without this, clients on other nodes only
+    // see cursor changes via the next full presence:update broadcast.
     // The publisherId field lets each node's subscription callback suppress the
     // echo for the publishing node (which already emitted locally above).
     try {
-      await publish(`cursor:${docId}`, broadcastPayload)
+      await publish(`presence:${docId}`, broadcastPayload)
     } catch (pubErr) {
       logger.error(
         { pubErr, docId },
