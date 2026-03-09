@@ -2,6 +2,8 @@ import type { Server, Socket } from 'socket.io'
 import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
 import { getSession, setSession } from '../../redis/session'
+import { publish } from '../../redis/pubsub'
+import { NODE_ID } from '../../config/node-id'
 import { logger } from '../../utils/logger'
 import type { SocketData } from '../server'
 
@@ -63,15 +65,32 @@ export async function handleCursorUpdate(
     }
 
     await setSession(socket.id, { ...session, cursor, lastSeen: Date.now() })
-    // Emit a single-user delta instead of refetching and broadcasting the full
-    // session list.  Presence:update (full list) is still emitted on join/leave
-    // and presence:ping so clients always have a reconciliation path.
-    io.to(docId).emit(WS.CURSOR_BROADCAST, {
+
+    const broadcastPayload = {
       userId: session.userId,
       name: session.name,
       color: session.color,
       cursor,
-    })
+      publisherId: NODE_ID,
+    }
+
+    // Emit directly to local sockets first — reliable local delivery must not
+    // depend on the Redis subscription being healthy.
+    io.to(docId).emit(WS.CURSOR_BROADCAST, broadcastPayload)
+
+    // Cross-node fanout: publish to the cursor:{docId} channel so other server
+    // nodes can re-emit to their local sockets.  Without this, clients on other
+    // nodes only see cursor changes via the next full presence:update broadcast.
+    // The publisherId field lets each node's subscription callback suppress the
+    // echo for the publishing node (which already emitted locally above).
+    try {
+      await publish(`cursor:${docId}`, broadcastPayload)
+    } catch (pubErr) {
+      logger.error(
+        { pubErr, docId },
+        'cursor:update: Redis publish failed — remote nodes will not receive this cursor update'
+      )
+    }
   } catch (err) {
     logger.error({ err, docId }, 'handleCursorUpdate: failed')
     socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to update cursor' })

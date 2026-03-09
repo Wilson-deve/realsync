@@ -25,65 +25,90 @@ export interface SocketData {
  * `io.to(docId).emit(OP_BROADCAST, ...)` → clients on B receive the op.
  */
 function setupCrossNodeBroadcast(io: Server): void {
-  // Keyed by room name.  The value is the pending subscribe() promise while
-  // the SUBSCRIBE is in flight, and the resolved unsubscribe function once it
-  // completes.  Storing the promise immediately (before subscribe() resolves)
-  // prevents two rapid join-room events from both calling subscribe() and
-  // registering duplicate message handlers for the same room.
-  const roomState = new Map<string, Promise<() => Promise<void>>>()
+  // Two parallel Maps — one per pub/sub channel type — both keyed by room name.
+  // Each stores the pending/resolved subscribe() promise so concurrent join-room
+  // events skip duplicate SUBSCRIBE calls, and leave-room can unsubscribe when
+  // the last socket leaves.  See individual subscribe blocks for why the raw
+  // promise is stored before chaining .catch (retry-safety).
+  const opRoomState = new Map<string, Promise<() => Promise<void>>>()
+  const cursorRoomState = new Map<string, Promise<() => Promise<void>>>()
+
+  // Helper: subscribe to a channel, store the promise in the given map, and
+  // register a side-effect-only .catch that removes the entry on failure so
+  // the next join-room can retry.  Returns the pending promise.
+  function subscribeRoom(
+    map: Map<string, Promise<() => Promise<void>>>,
+    channel: string,
+    handler: (data: unknown) => void
+  ): void {
+    const pending = subscribe(channel, handler)
+    map.set(channel, pending)
+    pending.catch((err: unknown) => {
+      map.delete(channel)
+      logger.error(
+        { err, channel },
+        'Redis subscribe failed — cross-node broadcast disabled for channel'
+      )
+    })
+  }
 
   io.of('/').adapter.on('join-room', (room: string, id: string) => {
     if (room === id) return
-    if (roomState.has(room)) return // subscribe already in flight or completed
 
-    const pending = subscribe(`doc:${room}`, (data: unknown) => {
-      // Skip messages published by this node — it already emitted to its local
-      // sockets directly in handleOpSubmit.  Without this guard, every op
-      // would be emitted twice to clients on the publishing node.
-      if (
-        typeof data === 'object' &&
-        data !== null &&
-        (data as Record<string, unknown>).publisherId === NODE_ID
-      ) {
-        return
-      }
-      io.to(room).emit(WS.OP_BROADCAST, data)
-    })
+    // op:broadcast channel
+    if (!opRoomState.has(room)) {
+      subscribeRoom(opRoomState, `doc:${room}`, (data: unknown) => {
+        // Skip messages published by this node — it already emitted to its local
+        // sockets directly in handleOpSubmit.  Without this guard, every op
+        // would be emitted twice to clients on the publishing node.
+        if (
+          typeof data === 'object' &&
+          data !== null &&
+          (data as Record<string, unknown>).publisherId === NODE_ID
+        ) {
+          return
+        }
+        io.to(room).emit(WS.OP_BROADCAST, data)
+      })
+    }
 
-    // Store the raw subscribe() promise immediately so that any concurrent
-    // join-room events see the entry and skip — preventing duplicate Redis
-    // SUBSCRIBE calls for the same room.
-    roomState.set(room, pending)
-
-    // Register a cleanup handler separately from the value stored in the Map.
-    // If subscribe() rejects, remove the entry so the next join-room event
-    // can attempt a fresh subscribe.  We do NOT chain this catch onto `pending`
-    // before inserting it into the Map: chaining would replace the stored value
-    // with a promise that resolves to a no-op function on failure, making the
-    // Map entry permanently non-retriable (the no-op would survive any future
-    // leave-room clean-up and the entry would never be re-inserted).
-    pending.catch((err: unknown) => {
-      roomState.delete(room)
-      logger.error({ err, room }, 'Redis subscribe failed — cross-node broadcast disabled for room')
-    })
+    // cursor:broadcast channel — mirrors op fanout so clients on other nodes
+    // receive real-time cursor deltas without waiting for presence:update.
+    if (!cursorRoomState.has(room)) {
+      subscribeRoom(cursorRoomState, `cursor:${room}`, (data: unknown) => {
+        if (
+          typeof data === 'object' &&
+          data !== null &&
+          (data as Record<string, unknown>).publisherId === NODE_ID
+        ) {
+          return
+        }
+        io.to(room).emit(WS.CURSOR_BROADCAST, data)
+      })
+    }
   })
 
   io.of('/').adapter.on('leave-room', (room: string, id: string) => {
     if (room === id) return
     if (io.sockets.adapter.rooms.get(room)) return // other sockets still in the room
 
-    const pending = roomState.get(room)
-    if (!pending) return
-    roomState.delete(room)
-
-    // Await the in-flight subscribe (if still pending) then unsubscribe.
-    // This handles the race where the last socket leaves before subscribe()
-    // resolves — without this the Redis subscription would leak indefinitely.
-    pending
-      .then((unsub) => unsub())
-      .catch((err: unknown) => {
-        logger.warn({ err, room }, 'Redis unsubscribe failed')
-      })
+    // Unsubscribe both channels when the last socket leaves the room.
+    for (const [map, channel] of [
+      [opRoomState, `doc:${room}`],
+      [cursorRoomState, `cursor:${room}`],
+    ] as [Map<string, Promise<() => Promise<void>>>, string][]) {
+      const pending = map.get(channel)
+      if (!pending) continue
+      map.delete(channel)
+      // Await the in-flight subscribe (if still pending) then unsubscribe.
+      // This handles the race where the last socket leaves before subscribe()
+      // resolves — without this the Redis subscription would leak indefinitely.
+      pending
+        .then((unsub) => unsub())
+        .catch((err: unknown) => {
+          logger.warn({ err, channel }, 'Redis unsubscribe failed')
+        })
+    }
   })
 }
 

@@ -26,6 +26,18 @@ export async function takeSnapshot(docId: string, serverVersion: number): Promis
       return
     }
 
+    // If the stored snapshot is already at or ahead of the target version, a
+    // newer job already completed — this one is a no-op.  Return early to avoid
+    // running getOperationsSince() (which would return an empty list) and then
+    // tripping the state.version !== serverVersion assertion with a noisy error.
+    if (doc.snapshotVersion >= serverVersion) {
+      logger.debug(
+        { docId, snapshotVersion: doc.snapshotVersion, serverVersion },
+        'takeSnapshot: already up-to-date — skipping'
+      )
+      return
+    }
+
     // Replay only the operations that were applied up to and including
     // `serverVersion`. Without the upper bound, ops written after this snapshot
     // job was scheduled (but before it runs) would be included, producing
