@@ -32,7 +32,18 @@ export interface ServerToClientEvents {
     cursor: number
   }) => void
   'presence:update': (payload: { users: SessionData[] }) => void
-  'doc:reconnect': (payload: { snapshot: string; version: number; ops: unknown[] }) => void
+  'doc:reconnect': (payload: {
+    snapshot: string
+    version: number
+    ops: unknown[]
+    /** The server version the client is synchronised to after replaying ops.
+     *  Any op:broadcast received with serverVersion > syncedVersion arrived
+     *  after the snapshot was taken and must be applied on top; any broadcast
+     *  with serverVersion <= syncedVersion is already included in ops and can
+     *  be discarded.  Clients should buffer broadcasts received between
+     *  room:join and doc:reconnect and apply only those above this boundary. */
+    syncedVersion: number
+  }) => void
   error: (payload: { code: string; message: string }) => void
 }
 

@@ -123,6 +123,7 @@ export async function handleOpSubmit(
   // transform, persist, and version-counter advance (steps 3–7).  ACK and
   // broadcast (steps 8–9) are pure I/O that do not need mutual exclusion.
   let shouldReconnect = false
+  let reconnectVersion = 0 // the server version the out-of-sync client should resync to
   let pendingAck: {
     serverVersion: number
     transformedOp: Op
@@ -152,6 +153,7 @@ export async function handleOpSubmit(
         'op:submit: clientVersion ahead of server — forcing reconnect'
       )
       shouldReconnect = true
+      reconnectVersion = currentVersion
     } else if (currentVersion - clientVersion > env.OP_MAX_CATCHUP_OPS) {
       // Client is too far behind the current server version.  Applying
       // O(N) transforms while holding the lock would block all other writers
@@ -163,6 +165,7 @@ export async function handleOpSubmit(
         'op:submit: client too far behind catch-up window — forcing reconnect'
       )
       shouldReconnect = true
+      reconnectVersion = currentVersion
     } else {
       // Step 4 — fetch all operations applied since the client's version.
       const serverOps = await getOperationsSince(docId, clientVersion)
@@ -256,11 +259,16 @@ export async function handleOpSubmit(
   if (shouldReconnect) {
     try {
       const doc = await getDocument(docId)
-      const ops = doc ? await getOperationsSince(docId, doc.snapshotVersion) : []
+      // Bound the ops fetch to reconnectVersion (captured inside the lock)
+      // so the payload is bounded and duplicate-free: the client is already
+      // in the room and may receive op:broadcast for versions > reconnectVersion;
+      // only ops <= reconnectVersion belong in this resync payload.
+      const ops = doc ? await getOperationsSince(docId, doc.snapshotVersion, reconnectVersion) : []
       socket.emit(WS.DOC_RECONNECT, {
         snapshot: doc?.snapshotContent ?? '',
         version: doc?.snapshotVersion ?? 0,
         ops,
+        syncedVersion: reconnectVersion,
       })
     } catch (err) {
       logger.error({ err, docId }, 'handleOpSubmit: reconnect fetch failed')

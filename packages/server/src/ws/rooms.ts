@@ -1,9 +1,15 @@
 import type { Server, Socket } from 'socket.io'
 import { WS } from './events'
 import type { ServerToClientEvents, ClientToServerEvents } from './events'
-import { getSession, setSession, deleteSession, getDocSessions } from '../redis/session'
+import {
+  getSession,
+  setSession,
+  deleteSession,
+  getDocSessions,
+  getDocVersion,
+} from '../redis/session'
 import { getDocument } from '../db/documents'
-import { getOperationsSince } from '../db/operations'
+import { getOperationsSince, getMaxOperationVersion } from '../db/operations'
 import { handleOpSubmit } from './handlers/op.handler'
 import { handleCursorUpdate } from './handlers/cursor.handler'
 import { handlePresencePing } from './handlers/presence.handler'
@@ -83,6 +89,23 @@ export function registerHandlers(
         }
       }
 
+      // Capture the current server version BEFORE joining the Socket.io room.
+      // This is the version ceiling that bounds the initial sync payload.
+      //
+      // Why the order matters:
+      //   socket.join(docId) makes the socket eligible to receive op:broadcast
+      //   from Redis pub/sub immediately.  If we read ops AFTER joining, any op
+      //   committed between the DB read and the join is forwarded as a broadcast
+      //   AND included in the ops array — a duplicate.  By capturing the version
+      //   ceiling first, then joining, then fetching ops up to that ceiling:
+      //     - ops in doc:reconnect are bounded to <= syncedVersion
+      //     - any op:broadcast arriving after join has serverVersion > syncedVersion
+      //     - the client applies broadcasts only above the boundary — no duplicates
+      let syncedVersion = await getDocVersion(docId)
+      if (syncedVersion === null) {
+        syncedVersion = await getMaxOperationVersion(docId)
+      }
+
       await socket.join(docId)
 
       await setSession(socket.id, {
@@ -99,11 +122,15 @@ export function registerHandlers(
       // replay `opsSinceSnapshot` on top of the snapshot to reach current state.
       // Without this, clients joining between snapshots would receive a stale
       // document with no way to catch up.
-      const opsSinceSnapshot = await getOperationsSince(docId, doc.snapshotVersion)
+      // Fetch only the ops between the snapshot and the captured ceiling so
+      // the doc:reconnect payload is bounded and duplicate-free with respect
+      // to any op:broadcast the socket receives after joining above.
+      const opsSinceSnapshot = await getOperationsSince(docId, doc.snapshotVersion, syncedVersion)
       socket.emit(WS.DOC_RECONNECT, {
         snapshot: doc.snapshotContent,
         version: doc.snapshotVersion,
         ops: opsSinceSnapshot,
+        syncedVersion,
       })
 
       // Broadcast updated presence list to everyone in the room.
