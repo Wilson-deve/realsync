@@ -37,6 +37,14 @@ function schedulePresenceBroadcast(
     docId,
     setTimeout(() => {
       broadcastTimers.delete(docId)
+
+      // If the room is empty by the time the timer fires (e.g. the last socket
+      // disconnected during the debounce window), skip the Redis read and emit.
+      // io.sockets.adapter.rooms only tracks sockets on THIS node, which is the
+      // right scope: we only need to emit to local sockets, and if there are
+      // none there is nothing to do here.
+      if (!io.sockets.adapter.rooms.get(docId)?.size) return
+
       getDocSessions(docId)
         .then((sessions) => {
           io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })

@@ -37,19 +37,32 @@ export async function takeSnapshot(docId: string, serverVersion: number): Promis
       state = apply(state, op)
     }
 
-    // Persist only if this version is newer than whatever is currently stored.
-    // takeSnapshot() jobs run via setImmediate and can complete out of order;
-    // updateSnapshot() uses a snapshotVersion < newVersion guard so a stale
-    // job arriving late matches zero rows and does nothing rather than
-    // regressing the snapshot.
-    const updated = await updateSnapshot(docId, state.content, state.version)
+    // Guard against an incomplete or corrupt ops range.  apply() increments
+    // state.version by 1 for each op, so after replaying all ops up to
+    // serverVersion the result must equal serverVersion exactly.  A mismatch
+    // means ops had gaps (missing versions) or the ops range was incomplete —
+    // persisting mismatched content/version would corrupt the snapshot and
+    // produce incorrect document state for every future client join.
+    if (state.version !== serverVersion) {
+      logger.error(
+        { docId, serverVersion, replayedVersion: state.version, opCount: ops.length },
+        'takeSnapshot: state.version after replay does not match serverVersion — aborting to prevent corrupt snapshot'
+      )
+      return
+    }
+
+    // Persist serverVersion explicitly rather than state.version.  They are
+    // equal after the assertion above, but using the job's target version as
+    // the authoritative label makes the intent unambiguous and prevents any
+    // future divergence if apply() semantics change.
+    const updated = await updateSnapshot(docId, state.content, serverVersion)
     if (updated === 0) {
       logger.debug(
-        { docId, snapshotVersion: state.version },
+        { docId, snapshotVersion: serverVersion },
         'takeSnapshot: skipped — a newer snapshot already exists'
       )
     } else {
-      logger.debug({ docId, snapshotVersion: state.version }, 'takeSnapshot: snapshot updated')
+      logger.debug({ docId, snapshotVersion: serverVersion }, 'takeSnapshot: snapshot updated')
     }
   } catch (err) {
     logger.error({ docId, serverVersion, err }, 'takeSnapshot: failed — snapshot skipped')

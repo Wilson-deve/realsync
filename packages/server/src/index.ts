@@ -31,21 +31,37 @@ async function main(): Promise<void> {
   })
 
   // ── Graceful shutdown ──────────────────────────────────────────────────────
-  async function shutdown(signal: string): Promise<void> {
-    logger.info({ signal }, 'Shutting down gracefully…')
+  // A single shared promise ensures shutdown is idempotent: a second signal
+  // (e.g. SIGINT followed by SIGTERM) simply awaits the in-progress sequence
+  // rather than launching a second concurrent shutdown that would race
+  // io.close() / httpServer.close() and produce confusing double-logs or
+  // double-rejections.
+  let shutdownPromise: Promise<void> | null = null
 
-    // Close the Socket.io server first — stops accepting new WS connections
-    // and waits for existing sockets to disconnect.
-    await new Promise<void>((resolve) => io.close(() => resolve()))
+  function shutdown(signal: string): Promise<void> {
+    if (shutdownPromise) {
+      logger.info({ signal }, 'shutdown already in progress — ignoring duplicate signal')
+      return shutdownPromise
+    }
 
-    // Stop the HTTP server and wait for in-flight requests to finish.
-    await new Promise<void>((resolve, reject) =>
-      httpServer.close((err) => (err ? reject(err) : resolve()))
-    )
+    shutdownPromise = (async () => {
+      logger.info({ signal }, 'Shutting down gracefully…')
 
-    await Promise.allSettled([prisma.$disconnect(), pubClient.quit(), subClient.quit()])
-    logger.info('Shutdown complete')
-    process.exit(0)
+      // Close the Socket.io server first — stops accepting new WS connections
+      // and waits for existing sockets to disconnect.
+      await new Promise<void>((resolve) => io.close(() => resolve()))
+
+      // Stop the HTTP server and wait for in-flight requests to finish.
+      await new Promise<void>((resolve, reject) =>
+        httpServer.close((err) => (err ? reject(err) : resolve()))
+      )
+
+      await Promise.allSettled([prisma.$disconnect(), pubClient.quit(), subClient.quit()])
+      logger.info('Shutdown complete')
+      process.exit(0)
+    })()
+
+    return shutdownPromise
   }
 
   process.on('SIGTERM', () => {
