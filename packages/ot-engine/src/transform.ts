@@ -1,21 +1,11 @@
 import type { Op, InsertOp, DeleteOp } from './type'
 
-/**
- * Transforms two concurrent operations against each other.
- *
- * Returns `[op1', op2']` where:
- *   - `op1'` is op1 adjusted to be applied AFTER op2
- *   - `op2'` is op2 adjusted to be applied AFTER op1
- *
- * Convergence guarantee:
- *   `apply(apply(S, op1), op2') === apply(apply(S, op2), op1')`
- */
+/** Transforms two concurrent operations against each other. */
 export function transform(op1: Op, op2: Op): [Op, Op] {
   if (op1.type === 'insert' && op2.type === 'insert') return transformII(op1, op2)
   if (op1.type === 'insert' && op2.type === 'delete') return transformID(op1, op2)
   if (op1.type === 'delete' && op2.type === 'insert') {
-    // transformID(ins, del) returns [ins', del'] = [op2', op1'].
-    // We need [op1', op2'], so swap the destructuring.
+    // Swap destructuring to return [op1', op2'] instead of [op2', op1'].
     const [op2p, op1p] = transformID(op2, op1)
     return [op1p, op2p]
   }
@@ -44,14 +34,7 @@ function transformID(ins: InsertOp, del: DeleteOp): [Op, Op] {
   if (ins.position >= del.position + del.length) {
     return [{ ...ins, position: ins.position - del.length }, { ...del }]
   }
-  // Insert is inside the deleted range: the delete "wins".
-  // Neutralize the insert (content: '' — no-op w.r.t. document content;
-  // note that apply() still increments version, which is correct because
-  // the op occupies a slot in the server's operation log) and expand
-  // the delete by the inserted length so it still covers the same logical
-  // region after the insertion shifted positions in path A.
-  // This is the only assignment of [op1', op2'] that satisfies:
-  //   apply(apply(S, ins), del') === apply(apply(S, del), ins')
+  // Insert is inside the deleted range: neutralize the insert and expand the delete.
   return [
     { ...ins, content: '' },
     { ...del, length: del.length + ins.content.length },

@@ -18,7 +18,6 @@ import { logger } from '../utils/logger'
 import type { SocketData } from './server'
 
 // Assign a consistent color to a user based on their userId.
-// The same userId always gets the same color across sessions.
 const COLORS = [
   '#FF6B6B',
   '#4ECDC4',
@@ -36,10 +35,7 @@ function assignColor(userId: string): string {
   return COLORS[hash % COLORS.length]
 }
 
-/**
- * Register all Socket.io event handlers for a newly-connected socket.
- * Called once per connection from the Socket.io `connection` event.
- */
+/** Registers all Socket.io event handlers for a newly-connected socket. */
 export function registerHandlers(
   io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
   socket: Socket<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>
@@ -64,25 +60,12 @@ export function registerHandlers(
       }
 
       // Authorisation: the document must belong to the user's workspace.
-      // Without this check, any authenticated user who knows a docId can join
-      // documents from other workspaces and read or write their content.
       if (doc.workspaceId !== socket.data.workspaceId) {
         socket.emit(WS.ERROR, { code: 'FORBIDDEN', message: `Document ${docId} not found` })
         return
       }
 
-      // One-doc-per-socket enforcement:
-      // Session storage is keyed only by socket.id, so joining a second
-      // document would overwrite the single session record while leaving a
-      // stale entry in the previous doc's session set.  Auto-leave every
-      // existing document room before joining the new one.
-      //
-      // Failure semantics: if any step of the auto-leave fails we abort the
-      // join and return an error to the client.  Continuing after a partial
-      // leave would leave the socket joined to both the old and the new room
-      // simultaneously, causing it to receive broadcasts for a document it no
-      // longer has a valid session for and leaving stale presence entries in
-      // the old room that would never be cleaned up.
+      // One-doc-per-socket enforcement: Auto-leave every existing document room before joining a new one to prevent stale sessions.
       const existingDocRooms = Array.from(socket.rooms).filter(
         (r) => r !== socket.id && r !== docId
       )
@@ -102,34 +85,13 @@ export function registerHandlers(
         }
       }
 
-      // Join the room FIRST so no broadcast can be missed, then capture the
-      // version ceiling as the deduplication boundary.
-      //
-      // Correct ordering:
-      //   1. socket.join(docId)  — socket is now in the room; every subsequent
-      //      op:broadcast is queued / delivered to this socket.
-      //   2. Capture syncedVersion — any op committed AFTER this point will be
-      //      broadcast AND have serverVersion > syncedVersion.
-      //   3. Fetch ops up to syncedVersion — the array covers  everything up to
-      //      the boundary; no gap, no overlap with future broadcasts.
-      //   4. Emit doc:reconnect with syncedVersion — the client discards any
-      //      buffered broadcast whose serverVersion <= syncedVersion (already in
-      //      ops) and applies broadcasts with serverVersion > syncedVersion on top.
-      //
-      // Previous (wrong) order  — capture version, then join — had a gap:
-      //   an op committed between the read and the join was broadcast before the
-      //   socket was in the room (missed) AND excluded from the ops array
-      //   (payload was bounded to the old ceiling) → permanent data loss.
+      // Join the room FIRST so no broadcast is missed, then capture the version ceiling as the sync boundary.
       await socket.join(docId)
 
       let syncedVersion = await getDocVersion(docId)
       if (syncedVersion === null) {
         syncedVersion = await getMaxOperationVersion(docId)
-        // Persist the seeded version back to Redis so subsequent joins on this
-        // node (or others, if using a shared Redis) read O(1) instead of
-        // re-running the DB MAX aggregate on every join after a restart or
-        // Redis eviction.  The NX flag ensures we don't race-overwrite a newer
-        // version that handleOpSubmit may have written concurrently.
+        // Persist the seeded version back to Redis immediately for quick retrieval by other sockets.
         await setDocVersion(docId, syncedVersion, /* nx */ true)
       }
 
@@ -142,14 +104,7 @@ export function registerHandlers(
         lastSeen: Date.now(),
       })
 
-      // Send the snapshot plus every op applied since it was taken.
-      // Snapshots are only written every 100 ops, so a joining client must
-      // replay `opsSinceSnapshot` on top of the snapshot to reach current state.
-      // Without this, clients joining between snapshots would receive a stale
-      // document with no way to catch up.
-      // Fetch only the ops between the snapshot and the captured ceiling so
-      // the doc:reconnect payload is bounded and duplicate-free with respect
-      // to any op:broadcast the socket receives after joining above.
+      // Send the ops applied since the last snapshot up to syncedVersion.
       const opsSinceSnapshot = await getOperationsSince(docId, doc.snapshotVersion, syncedVersion)
       socket.emit(WS.DOC_RECONNECT, {
         snapshot: doc.snapshotContent,
@@ -165,10 +120,7 @@ export function registerHandlers(
       logger.error({ err, docId }, 'room:join failed')
       socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to join document' })
 
-      // If socket.join(docId) already ran before the failure, the socket is
-      // sitting in the room without a valid session.  This would keep
-      // cross-node Redis subscriptions alive and deliver spurious broadcasts
-      // until the client disconnects.  Best-effort rollback:
+      // Best-effort rollback: if socket.join(docId) already ran, leave the room.
       if (socket.rooms.has(docId)) {
         try {
           await socket.leave(docId)
@@ -196,8 +148,7 @@ export function registerHandlers(
     const { docId } = payload as { docId: string }
 
     try {
-      // The Socket.io room membership is the authoritative source: if the
-      // socket is not in the room there is nothing to leave.
+      // The Socket.io room membership is the authoritative source.
       if (!socket.rooms.has(docId)) {
         logger.warn(
           { socketId: socket.id, payloadDocId: docId },
@@ -206,20 +157,14 @@ export function registerHandlers(
         return
       }
 
-      // If the session exists and its docId doesn't match the payload, the
-      // state is inconsistent — but the socket IS in the room and will keep
-      // receiving broadcasts until it leaves.  Log the mismatch for
-      // investigation and fall through to leave + cleanup anyway: the room
-      // membership in Socket.io is the authoritative state that must be
-      // corrected regardless of what Redis says.
+      // If session exists with mismatched docId, clean it up anyway because socket membership is authoritative.
       const session = await getSession(socket.id)
       if (session && session.docId !== docId) {
         logger.warn(
           { socketId: socket.id, sessionDocId: session.docId, payloadDocId: docId },
           'room:leave: session docId mismatch — leaving room and cleaning up both docIds'
         )
-        // Also clean up whichever docId the session points to, since that
-        // room's presence set may have a stale entry for this socket.
+        // Clean up whichever docId the session points to.
         try {
           await socket.leave(session.docId)
           await deleteSession(socket.id, session.docId)
@@ -234,8 +179,7 @@ export function registerHandlers(
       }
 
       await socket.leave(docId)
-      // Best-effort: delete the session even if getSession returned null
-      // (TTL expiry / eviction while the socket was still connected).
+      // Best-effort: delete the session even if getSession returned null.
       await deleteSession(socket.id, docId)
       const sessions = await getDocSessions(docId)
       io.to(docId).emit(WS.PRESENCE_UPDATE, { users: sessions })
@@ -245,11 +189,7 @@ export function registerHandlers(
   })
 
   // ── disconnecting ──────────────────────────────────────────────────────────
-  // Use 'disconnecting' (not 'disconnect') because by the time 'disconnect'
-  // fires Socket.io has already removed the socket from all of its rooms, so
-  // socket.rooms only contains the socket's own private room, making the
-  // room-iteration loop below a no-op and leaving stale entries in every
-  // doc-sessions:* set.  'disconnecting' fires while rooms are still intact.
+  // Use 'disconnecting' because rooms are intact; 'disconnect' fires after rooms are cleared.
   socket.on('disconnecting', async () => {
     // Clean up every document room this socket was in.
     // Filter out the socket's own ID (Socket.io gives every socket a personal room).

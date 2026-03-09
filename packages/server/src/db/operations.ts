@@ -3,12 +3,7 @@ import type { OpType } from '@prisma/client'
 import type { Op } from '@realsync/ot-engine'
 import { prisma } from './client'
 
-/**
- * Cast a Prisma JsonValue (which is null when the column holds DbNull/JsonNull)
- * back to the attributes shape used by Op types.
- * Returns undefined when there are no attributes so the property is omitted
- * rather than set to null.
- */
+/** Casts a Prisma JsonValue back to the attributes shape used by Op types, omitting undefined. */
 function parseAttributes(raw: Prisma.JsonValue | null): Record<string, unknown> | undefined {
   if (raw === null || raw === undefined) return undefined
   if (typeof raw === 'object' && !Array.isArray(raw)) {
@@ -17,10 +12,7 @@ function parseAttributes(raw: Prisma.JsonValue | null): Record<string, unknown> 
   return undefined
 }
 
-/**
- * Persists a single OT operation to the append-only operation log.
- * `version` is the document version AFTER this operation is applied.
- */
+/** Persists a single OT operation to the append-only operation log. */
 export async function saveOperation(docId: string, userId: string, op: Op, version: number) {
   return prisma.operation.create({
     data: {
@@ -52,15 +44,7 @@ export async function getMaxOperationVersion(docId: string): Promise<number> {
   return result._max.version ?? 0
 }
 
-/**
- * Returns all operations on `docId` with version > `sinceVersion`,
- * ordered ascending — ready to be replayed in sequence.
- *
- * @param upToVersion  When provided, only operations with version <=
- *                     upToVersion are included. Use this in snapshot replay
- *                     to avoid incorporating ops written after the snapshot
- *                     was scheduled but before it ran.
- */
+/** Returns all operations on `docId` with version > `sinceVersion` ordered ascending. */
 export async function getOperationsSince(
   docId: string,
   sinceVersion: number,

@@ -50,27 +50,7 @@ function isValidOp(value: unknown): value is Op {
   return false
 }
 
-/**
- * Handle an `op:submit` event from a connected client.
- *
- * This is the critical hot path — every keystroke flows through here.
- * The 9-step OT flow ensures all concurrently-editing clients converge
- * to the same document state:
- *
- *  1. Validate the incoming payload.
- *  2. Acquire a per-document mutex (prevents version collisions).
- *  3. Resolve the current server version; reject if client is ahead or too
- *     far behind (catch-up window exceeded → force resync).
- *  4. Fetch all server ops since the client's local version.
- *  5. Transform the client op against those server ops.
- *  6. Persist the *transformed* op with the new server version.
- *  7. Update the Redis version counter.
- *  8. Acknowledge the sender.
- *  9. Broadcast via Redis pub/sub to all server nodes.
- *
- * The lock is always released in the finally block — a leaked lock would
- * permanently freeze editing for the affected document.
- */
+/** Handles an op:submit event, running the OT convergence flow safely under a per-document lock. */
 export async function handleOpSubmit(
   io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
   socket: Socket<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
@@ -95,9 +75,7 @@ export async function handleOpSubmit(
   const lockKey = `lock:doc:${docId}`
   const start = Date.now()
 
-  // Authorisation guard: reject ops from sockets that haven't joined the room.
-  // A socket must complete room:join (which validates workspace ownership) before
-  // submitting ops — this prevents arbitrary document writes via a known docId.
+  // Authorisation guard: reject ops from sockets not in the document room.
   const session = await getSession(socket.id)
   if (!session || session.docId !== docId || !socket.rooms.has(docId)) {
     socket.emit(WS.ERROR, {
@@ -107,10 +85,7 @@ export async function handleOpSubmit(
     return
   }
 
-  // Step 2 — acquire per-document lock.
-  // Only one op can be processed for a given document at a time.
-  // Without this lock, two concurrent ops might both read version=5,
-  // both think they are version=6, and we get a version collision.
+  // Step 2 — acquire per-document lock to prevent version collisions.
   let lockToken: string
   try {
     lockToken = await acquireLock(lockKey, env.OP_LOCK_TTL_MS, 3000)
@@ -119,15 +94,10 @@ export async function handleOpSubmit(
     return
   }
 
-  // Flags/values set inside the lock and consumed after it is released.
-  // Keeping emit/publish/broadcast outside the critical section means the
-  // lock is held only for the minimum necessary work: version resolution,
-  // transform, persist, and version-counter advance (steps 3–7).  ACK and
-  // broadcast (steps 8–9) are pure I/O that do not need mutual exclusion.
+  // Flags and values set inside the lock and consumed outside it to minimize critical section.
   let shouldReconnect = false
   let reconnectVersion = 0 // the server version the out-of-sync client should resync to
-  // Hoisted outside the try block so the catch can read the DB-derived version
-  // when deciding whether to self-heal a stale Redis key (P2002 path).
+  // Capture DB-derived version outside try/catch to aid self-healing log.
   let resolvedVersion: number | null = null
   let pendingAck: {
     serverVersion: number
@@ -136,26 +106,19 @@ export async function handleOpSubmit(
   } | null = null
 
   try {
-    // Step 3 — resolve the authoritative server version inside the lock.
-    // This must happen before fetching ops so we can detect a "client ahead"
-    // condition (clientVersion > currentVersion) which means the client has a
-    // version that doesn't exist on the server yet — an impossible state under
-    // normal operation that indicates the client is out of sync.
+    // Step 3 — resolve authoritative server version and detect if client is out of sync.
     let currentVersion = await getDocVersion(docId)
     if (currentVersion === null) {
-      // Key missing: seed Redis from the highest version already in Postgres.
+      // Key missing: seed Redis from highest Postgres version.
       currentVersion = await getMaxOperationVersion(docId)
       await setDocVersion(docId, currentVersion)
       logger.info({ docId, currentVersion }, 'op:submit: seeded Redis version counter from DB')
     }
-    // Capture for the outer catch so P2002 self-healing can use the version
-    // that was in Redis (or freshly seeded) before the failed saveOperation.
+    // Capture for self-healing in post-lock path.
     resolvedVersion = currentVersion
 
     if (clientVersion > currentVersion) {
-      // Signal the post-lock path to send DOC_RECONNECT.  Do NOT call
-      // getDocument/getOperationsSince here — those DB queries must run
-      // outside the critical section so other writers can proceed.
+      // Signal post-lock path to force reconnect; avoid DB queries in critical section.
       logger.warn(
         { docId, clientVersion, currentVersion },
         'op:submit: clientVersion ahead of server — forcing reconnect'
@@ -163,11 +126,7 @@ export async function handleOpSubmit(
       shouldReconnect = true
       reconnectVersion = currentVersion
     } else if (currentVersion - clientVersion > env.OP_MAX_CATCHUP_OPS) {
-      // Client is too far behind the current server version.  Applying
-      // O(N) transforms while holding the lock would block all other writers
-      // on this document for the duration of two DB queries.  Force a full
-      // resync instead — the client will replay from the latest snapshot,
-      // which is never more than OP_MAX_CATCHUP_OPS ops old.
+      // Client is too far behind; force a full resync from latest snapshot instead of blocking writers.
       logger.warn(
         { docId, clientVersion, currentVersion, gap: currentVersion - clientVersion },
         'op:submit: client too far behind catch-up window — forcing reconnect'
@@ -185,12 +144,7 @@ export async function handleOpSubmit(
       const serverVersion = currentVersion + 1
       await saveOperation(docId, socket.data.userId, transformedOp, serverVersion)
 
-      // Step 7 — update the version counter in Redis.
-      // If this fails after saveOperation succeeds, Postgres has advanced but
-      // Redis is stuck at the old version.  Delete the key so the next lock
-      // acquisition re-seeds from getMaxOperationVersion rather than reusing
-      // the stale value and hitting a unique-constraint violation on every
-      // subsequent op.  The op IS durably persisted, so the ACK below is valid.
+      // Step 7 — update the version counter in Redis. Delete the key if it fails after DB save to self-heal.
       try {
         await setDocVersion(docId, serverVersion)
       } catch (setVersionErr) {
@@ -203,20 +157,14 @@ export async function handleOpSubmit(
         } catch (delErr) {
           logger.error({ delErr, docId }, 'op:submit: failed to delete stale doc-version key')
         }
-        // Do not re-throw: the op is saved; the version key self-heals on the
-        // next submission when the lock path re-seeds from getMaxOperationVersion.
+        // Do not re-throw: op is saved; key self-heals on next submission.
       }
 
-      // Critical section ends here.  Capture what the post-lock path needs;
-      // steps 8–9 (ACK + broadcast) run after the lock is released so that
-      // other writers can acquire the mutex immediately.
+      // Critical section ends. Capture details for post-lock ACK and broadcast.
       pendingAck = { serverVersion, transformedOp, authorId: socket.data.userId }
     }
   } catch (err) {
-    // Unique-constraint violation from saveOperation means Redis was stale:
-    // the version we tried to insert already exists in Postgres.  Delete the
-    // Redis key so the next lock acquisition re-seeds from getMaxOperationVersion
-    // and force the client to resync to a consistent state.
+    // Unique-constraint violation usually means Redis was stale; delete key to self-heal.
     if (
       err instanceof Prisma.PrismaClientKnownRequestError &&
       err.code === 'P2002' &&
@@ -241,11 +189,7 @@ export async function handleOpSubmit(
       socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to process operation' })
     }
   } finally {
-    // ALWAYS attempt to release the lock — a leaked lock freezes editing for
-    // this document. Wrap in try/catch so a Redis network error here does not
-    // become an unhandled rejection: the caller invokes this handler
-    // fire-and-forget (void ...), so any rejection escaping the finally block
-    // would not be caught and could crash the process.
+    // ALWAYS release the lock to prevent freezing the document. Try/catch to avoid unhandled rejections.
     try {
       await releaseLock(lockKey, lockToken!)
     } catch (releaseErr) {
@@ -256,22 +200,14 @@ export async function handleOpSubmit(
     }
   }
 
-  // Steps 8–9 — ACK + broadcast, now outside the critical section.
-  // The op is durably persisted and the version counter is advanced, so the
-  // lock is no longer needed.  Releasing it before these I/O calls lets other
-  // writers acquire the mutex immediately instead of waiting for network I/O.
+  // Steps 8–9 — ACK + broadcast outside critical section.
   if (pendingAck !== null) {
     const { serverVersion, transformedOp, authorId } = pendingAck
 
     // Step 8 — acknowledge the sender.
     socket.emit(WS.OP_ACK, { serverVersion, timestamp: Date.now() })
 
-    // Step 9 — broadcast to all clients.
-    // Always emit to sockets on THIS node directly: reliable local delivery
-    // must not depend on the Redis subscription being healthy.  For cross-node
-    // fanout, publish via Redis pub/sub; the publisherId field lets other nodes
-    // broadcast to their own clients while this node's subscription callback
-    // ignores the echo and avoids double-emitting.
+    // Step 9 — broadcast to all clients locally, and fan out across nodes via Redis publish.
     const broadcastPayload = {
       op: transformedOp,
       authorId,
@@ -282,9 +218,7 @@ export async function handleOpSubmit(
     // Local emit always happens unconditionally.
     io.to(docId).emit(WS.OP_BROADCAST, broadcastPayload)
 
-    // Cross-node fanout via Redis.  A failure here means remote nodes miss
-    // this op until the affected clients reconnect, but local clients are
-    // already covered.  Log for alerting so ops-on-call can investigate.
+    // Cross-node fanout via Redis. Log failure for ops awareness.
     try {
       await publish(`doc:${docId}`, broadcastPayload)
     } catch (pubErr) {
@@ -294,8 +228,7 @@ export async function handleOpSubmit(
       )
     }
 
-    // Snapshot optimisation: every 100 ops, compute and store a full document
-    // state to keep replay time bounded.
+    // Snapshot optimisation: compute full document state every 100 ops.
     if (serverVersion % 100 === 0) {
       setImmediate(() => {
         void takeSnapshot(docId, serverVersion)
@@ -305,16 +238,11 @@ export async function handleOpSubmit(
     logger.debug({ docId, serverVersion, latencyMs: Date.now() - start }, 'op:submit processed')
   }
 
-  // Post-lock: build and send the reconnect payload now that the mutex is
-  // released.  Other writers on this document can proceed concurrently while
-  // this slow-path DB fetch runs.
+  // Post-lock: build and send reconnect payload if flagged.
   if (shouldReconnect) {
     try {
       const doc = await getDocument(docId)
-      // Bound the ops fetch to reconnectVersion (captured inside the lock)
-      // so the payload is bounded and duplicate-free: the client is already
-      // in the room and may receive op:broadcast for versions > reconnectVersion;
-      // only ops <= reconnectVersion belong in this resync payload.
+      // Bound ops fetch to reconnectVersion for a duplicate-free resync payload.
       const ops = doc ? await getOperationsSince(docId, doc.snapshotVersion, reconnectVersion) : []
       socket.emit(WS.DOC_RECONNECT, {
         snapshot: doc?.snapshotContent ?? '',

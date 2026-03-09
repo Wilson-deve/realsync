@@ -4,13 +4,7 @@ import { logger } from '../utils/logger'
 
 const SESSION_TTL = 30 * 60 // 30 minutes in seconds
 
-/**
- * Inspect the per-command results returned by ioredis `multi().exec()`.
- * Each entry is a `[Error | null, unknown]` tuple — a non-null error means
- * that specific command failed even though the transaction was sent.
- * Throws an aggregated error if any command failed, or if the pipeline
- * itself was aborted (exec returned null, e.g. after a WATCH conflict).
- */
+/** Inspects the per-command results returned by ioredis `multi().exec()` and throws an aggregated error on failure or abort. */
 function assertExecResults(results: Array<[Error | null, unknown]> | null, context: string): void {
   if (results === null) {
     throw new Error(`Redis MULTI/EXEC aborted (WATCH conflict) in ${context}`)
@@ -23,8 +17,7 @@ function assertExecResults(results: Array<[Error | null, unknown]> | null, conte
   }
 }
 
-// Lua script: delete the key only when the stored value equals the caller's token.
-// Runs atomically inside Redis — no other command can execute between the GET and DEL.
+// Lua script: atomically deletes the key only when the stored value equals the caller's token.
 const RELEASE_LOCK_SCRIPT = `
 if redis.call('get', KEYS[1]) == ARGV[1] then
   return redis.call('del', KEYS[1])
@@ -42,17 +35,7 @@ export interface SessionData {
   lastSeen: number
 }
 
-/**
- * Write a session to Redis with a 30-minute TTL.
- * Also registers the sessionId in the per-document set so
- * `getDocSessions()` can enumerate all active sessions for a document.
- *
- * All three commands are dispatched atomically via MULTI/EXEC — Redis will
- * not interleave other clients' commands between them. Note: Redis does not
- * roll back on per-command runtime errors; `assertExecResults` checks the
- * per-command result array and throws if any command failed so the caller
- * is aware of partial writes.
- */
+/** Writes a session to Redis with a 30-minute TTL and registers it in the document's session set atomically. */
 export async function setSession(sessionId: string, data: SessionData): Promise<void> {
   const key = `session:${sessionId}`
   const results = await pubClient
@@ -64,10 +47,7 @@ export async function setSession(sessionId: string, data: SessionData): Promise<
   assertExecResults(results, `setSession(${sessionId})`)
 }
 
-/** Read a session by ID. Returns `null` if the key has expired or never existed.
- * If the stored value is not valid JSON (corrupted or schema mismatch), the key
- * is deleted and `null` is returned rather than letting the error bubble up.
- */
+/** Reads a session by ID, returning null and deleting the key if expired, missing, or corrupted. */
 export async function getSession(sessionId: string): Promise<SessionData | null> {
   const key = `session:${sessionId}`
   const raw = await pubClient.get(key)
@@ -81,12 +61,7 @@ export async function getSession(sessionId: string): Promise<SessionData | null>
   }
 }
 
-/** Remove a session and deregister it from its document's session set.
- * Both commands are dispatched atomically via MULTI/EXEC — no other client's
- * commands can interleave between them. Note: Redis does not roll back on
- * per-command errors; `assertExecResults` checks the result array and throws
- * if either command failed.
- */
+/** Removes a session and atomically deregisters it from its document's session set. */
 export async function deleteSession(sessionId: string, docId: string): Promise<void> {
   const results = await pubClient
     .multi()
@@ -96,13 +71,7 @@ export async function deleteSession(sessionId: string, docId: string): Promise<v
   assertExecResults(results, `deleteSession(${sessionId})`)
 }
 
-/**
- * Return all live SessionData objects for a given document.
- * Fetches all session keys in a single MGET round-trip instead of one GET
- * per session. Expired/missing sessions (null values) are filtered out and
- * their IDs are pruned from the doc-sessions set in one SREM call.
- * Corrupt values are logged and treated as missing.
- */
+/** Returns all live SessionData objects for a document, pruning expired and corrupt sessions. */
 export async function getDocSessions(docId: string): Promise<SessionData[]> {
   const ids = await pubClient.smembers(`doc-sessions:${docId}`)
   if (ids.length === 0) return []
@@ -139,13 +108,7 @@ export async function getDocSessions(docId: string): Promise<SessionData[]> {
   return live
 }
 
-/**
- * Return the current server-side version counter for a document.
- * Returns `null` when the Redis key is absent (never set or evicted after a
- * restart) so callers can distinguish that from an explicit version=0.
- * Returns a parsed integer when the key exists.
- * Throws if the stored value is not a valid non-negative integer.
- */
+/** Returns the current server-side version counter for a document or null if absent. */
 export async function getDocVersion(docId: string): Promise<number | null> {
   const v = await pubClient.get(`doc-version:${docId}`)
   if (v === null) return null
@@ -155,13 +118,7 @@ export async function getDocVersion(docId: string): Promise<number | null> {
   return Number(v)
 }
 
-/**
- * Persist the current version counter for a document.
- *
- * @param nx  When true, uses SET NX (only write if the key does not already
- *            exist).  Use this when seeding from the DB to avoid overwriting
- *            a version that handleOpSubmit may have written concurrently.
- */
+/** Persists the current version counter for a document, optionally using SET NX. */
 export async function setDocVersion(docId: string, version: number, nx = false): Promise<void> {
   if (nx) {
     await pubClient.set(`doc-version:${docId}`, version.toString(), 'NX')
@@ -175,21 +132,7 @@ export async function deleteDocVersion(docId: string): Promise<void> {
   await pubClient.del(`doc-version:${docId}`)
 }
 
-/**
- * Acquire a Redis-backed mutex with a spin-wait.
- * Returns a unique token that the caller MUST pass to `releaseLock`.
- *
- * @param key             Redis key used as the mutex.
- * @param lockTtlMs       How long the lock is held in Redis (PX expiry).
- *                        Must be long enough for the critical section to finish.
- * @param acquireTimeoutMs  Maximum time to spend waiting for the lock before
- *                        throwing. Defaults to `lockTtlMs` when omitted.
- *
- * Safety: stores a random token as the lock value instead of a constant.
- * This lets `releaseLock` verify ownership before deleting, preventing a
- * slow holder from releasing a lock that has already expired and been
- * re-acquired by another worker.
- */
+/** Acquires a Redis-backed mutex with a spin-wait and exponential backoff, returning a token for releaseLock. */
 export async function acquireLock(
   key: string,
   lockTtlMs: number,
@@ -201,8 +144,7 @@ export async function acquireLock(
   while (Date.now() < deadline) {
     const result = await pubClient.set(key, token, 'PX', lockTtlMs, 'NX')
     if (result === 'OK') return token
-    // Exponential backoff with full jitter: delay in [0, min(cap, base * 2^attempt)].
-    // This avoids thundering-herd when many workers contend for the same lock.
+    // Exponential backoff with full jitter to avoid thundering-herd.
     const cap = 500
     const base = 10
     const ceiling = Math.min(cap, base * 2 ** attempt)
@@ -213,14 +155,7 @@ export async function acquireLock(
   throw new Error(`Could not acquire lock: ${key}`)
 }
 
-/**
- * Release a Redis mutex acquired via `acquireLock`.
- * Uses a Lua script to atomically check the stored token before deleting,
- * so a holder whose TTL already expired cannot delete a new owner's lock.
- * Logs a warning when the script returns 0 — meaning the lock either expired
- * or was already taken by another holder — so the caller is aware it may have
- * operated outside the critical section.
- */
+/** Atomically releases a Redis mutex only if the stored token matches. */
 export async function releaseLock(key: string, token: string): Promise<void> {
   const released = await pubClient.eval(RELEASE_LOCK_SCRIPT, 1, key, token)
   if (released !== 1) {

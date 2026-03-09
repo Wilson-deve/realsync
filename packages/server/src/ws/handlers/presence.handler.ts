@@ -10,20 +10,7 @@ interface PresencePingPayload {
   docId: string
 }
 
-/**
- * Per-room debounce timers for presence broadcasts.
- *
- * When a ping arrives, setSession() is called immediately (O(1) Redis write),
- * and a deferred broadcast is scheduled.  Subsequent pings within the window
- * reset the timer so only ONE getDocSessions() call and ONE PRESENCE_UPDATE
- * emit fire per PRESENCE_DEBOUNCE_MS interval, regardless of how many clients
- * ping concurrently.  This collapses O(N) Redis work + O(N) network fanout
- * per heartbeat into O(1) work amortised over the debounce window.
- *
- * Join and leave events skip this path and broadcast immediately (they already
- * do so in rooms.ts), so clients always see an accurate presence list upon
- * any membership change.
- */
+/** Per-room debounce timers to collapse concurrent presence pings into a single broadcast. */
 const broadcastTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 function schedulePresenceBroadcast(
@@ -38,11 +25,7 @@ function schedulePresenceBroadcast(
     setTimeout(() => {
       broadcastTimers.delete(docId)
 
-      // If the room is empty by the time the timer fires (e.g. the last socket
-      // disconnected during the debounce window), skip the Redis read and emit.
-      // io.sockets.adapter.rooms only tracks sockets on THIS node, which is the
-      // right scope: we only need to emit to local sockets, and if there are
-      // none there is nothing to do here.
+      // Skip broadcast if the room has no local sockets.
       if (!io.sockets.adapter.rooms.get(docId)?.size) return
 
       getDocSessions(docId)
@@ -56,17 +39,7 @@ function schedulePresenceBroadcast(
   )
 }
 
-/**
- * Handle a `presence:ping` heartbeat event from a connected client.
- *
- * Updates the sender's `lastSeen` in Redis immediately (O(1)), then
- * schedules a coalesced PRESENCE_UPDATE broadcast.  All pings arriving
- * within PRESENCE_DEBOUNCE_MS (default 2 s) collapse into a single
- * getDocSessions() read and one io.to(docId).emit(), reducing the
- * per-heartbeat cost from O(N) to O(1) under concurrent load.
- *
- * Clients should send this every 15–30 seconds to stay "active".
- */
+/** Handles a presence:ping event by updating lastSeen and scheduling a coalesced broadcast. */
 export async function handlePresencePing(
   io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
   socket: Socket<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
@@ -87,8 +60,7 @@ export async function handlePresencePing(
     const session = await getSession(socket.id)
     if (!session) return
 
-    // Same guard as cursor:update: reject pings that claim a docId the socket
-    // hasn't actually joined to prevent cross-room presence broadcasts.
+    // Guard: reject pings for rooms the socket hasn't joined.
     if (session.docId !== docId || !socket.rooms.has(docId)) {
       logger.warn(
         { socketId: socket.id, sessionDocId: session.docId, payloadDocId: docId },
@@ -97,11 +69,10 @@ export async function handlePresencePing(
       return
     }
 
-    // O(1): refresh this socket's lastSeen — no list scan on the hot path.
+    // O(1): refresh this socket's lastSeen.
     await setSession(socket.id, { ...session, lastSeen: Date.now() })
 
-    // Coalesced broadcast: defers the expensive getDocSessions() + emit to
-    // the end of the debounce window so N concurrent pings cost O(1) not O(N).
+    // Coalesced broadcast: defers expensive read/emit to the end of the debounce window.
     schedulePresenceBroadcast(io, docId)
   } catch (err) {
     logger.error({ err, docId }, 'handlePresencePing: failed')

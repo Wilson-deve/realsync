@@ -12,19 +12,7 @@ interface CursorUpdatePayload {
   cursor: number
 }
 
-/**
- * Handle a `cursor:update` event from a connected client.
- *
- * Validates the payload, persists the new cursor position in the Redis session
- * store, then broadcasts a lightweight delta (`cursor:broadcast`) containing
- * only the fields that changed for the one user.  This avoids refetching the
- * full presence list from Redis and re-serialising all N sessions on every
- * keystroke, which would become a significant Redis + network hotspot at scale.
- *
- * Clients should apply the delta to their local presence map rather than
- * replacing the whole list.  A full `presence:update` is still sent by
- * room:join / presence:ping / disconnect to keep the authoritative list in sync.
- */
+/** Handles a cursor:update event by saving to Redis and broadcasting a lightweight delta. */
 export async function handleCursorUpdate(
   io: Server<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
   socket: Socket<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>,
@@ -52,10 +40,7 @@ export async function handleCursorUpdate(
     const session = await getSession(socket.id)
     if (!session) return
 
-    // Guard: the session's recorded docId must match the payload docId, and
-    // the socket must actually be in that Socket.io room.  Without this, a
-    // client could supply an arbitrary docId and trigger presence broadcasts
-    // into rooms it has never joined, or corrupt another document's presence.
+    // Guard: session docId must match payload docId and socket must be in the room.
     if (session.docId !== docId || !socket.rooms.has(docId)) {
       logger.warn(
         { socketId: socket.id, sessionDocId: session.docId, payloadDocId: docId },
@@ -74,16 +59,10 @@ export async function handleCursorUpdate(
       publisherId: NODE_ID,
     }
 
-    // Emit directly to local sockets first — reliable local delivery must not
-    // depend on the Redis subscription being healthy.
+    // Emit directly to local sockets first.
     io.to(docId).emit(WS.CURSOR_BROADCAST, broadcastPayload)
 
-    // Cross-node fanout: publish to the presence:{docId} channel (the established
-    // convention in pubsub.ts for cursor + user state) so other server nodes can
-    // re-emit to their local sockets.  Without this, clients on other nodes only
-    // see cursor changes via the next full presence:update broadcast.
-    // The publisherId field lets each node's subscription callback suppress the
-    // echo for the publishing node (which already emitted locally above).
+    // Cross-node fanout: publish to presence channel so other nodes can emit locally.
     try {
       await publish(`presence:${docId}`, broadcastPayload)
     } catch (pubErr) {

@@ -1,6 +1,5 @@
 import type { SessionData } from '../redis/session'
 
-/** All Socket.io event name constants. Import from here — no magic strings elsewhere. */
 export const WS = {
   // Client → Server
   OP_SUBMIT: 'op:submit',
@@ -18,13 +17,12 @@ export const WS = {
   ERROR: 'error',
 } as const
 
-// ── Socket.io typed event maps ───────────────────────────────────────────────
 
 /** Events the server can emit to a client. */
 export interface ServerToClientEvents {
   'op:ack': (payload: { serverVersion: number; timestamp: number }) => void
   'op:broadcast': (payload: unknown) => void
-  /** Delta update: a single user's cursor moved. Cheaper than a full presence:update. */
+  /** Delta update: a single user's cursor moved. */
   'cursor:broadcast': (payload: {
     userId: string
     name: string
@@ -36,12 +34,7 @@ export interface ServerToClientEvents {
     snapshot: string
     version: number
     ops: unknown[]
-    /** The server version the client is synchronised to after replaying ops.
-     *  Any op:broadcast received with serverVersion > syncedVersion arrived
-     *  after the snapshot was taken and must be applied on top; any broadcast
-     *  with serverVersion <= syncedVersion is already included in ops and can
-     *  be discarded.  Clients should buffer broadcasts received between
-     *  room:join and doc:reconnect and apply only those above this boundary. */
+    /** The server version the client is synchronised to after replaying ops. */
     syncedVersion: number
   }) => void
   error: (payload: { code: string; message: string }) => void
