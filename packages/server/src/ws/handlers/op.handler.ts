@@ -2,6 +2,7 @@ import type { Server, Socket } from 'socket.io'
 import type { Op } from '@realsync/ot-engine'
 import { WS } from '../events'
 import type { ServerToClientEvents, ClientToServerEvents } from '../events'
+import { Prisma } from '@prisma/client'
 import { getOperationsSince, saveOperation, getMaxOperationVersion } from '../../db/operations'
 import { getDocument } from '../../db/documents'
 import { publish } from '../../redis/pubsub'
@@ -10,6 +11,7 @@ import {
   releaseLock,
   getDocVersion,
   setDocVersion,
+  deleteDocVersion,
   getSession,
 } from '../../redis/session'
 import { logger } from '../../utils/logger'
@@ -124,6 +126,9 @@ export async function handleOpSubmit(
   // broadcast (steps 8–9) are pure I/O that do not need mutual exclusion.
   let shouldReconnect = false
   let reconnectVersion = 0 // the server version the out-of-sync client should resync to
+  // Hoisted outside the try block so the catch can read the DB-derived version
+  // when deciding whether to self-heal a stale Redis key (P2002 path).
+  let resolvedVersion: number | null = null
   let pendingAck: {
     serverVersion: number
     transformedOp: Op
@@ -143,6 +148,9 @@ export async function handleOpSubmit(
       await setDocVersion(docId, currentVersion)
       logger.info({ docId, currentVersion }, 'op:submit: seeded Redis version counter from DB')
     }
+    // Capture for the outer catch so P2002 self-healing can use the version
+    // that was in Redis (or freshly seeded) before the failed saveOperation.
+    resolvedVersion = currentVersion
 
     if (clientVersion > currentVersion) {
       // Signal the post-lock path to send DOC_RECONNECT.  Do NOT call
@@ -178,7 +186,26 @@ export async function handleOpSubmit(
       await saveOperation(docId, socket.data.userId, transformedOp, serverVersion)
 
       // Step 7 — update the version counter in Redis.
-      await setDocVersion(docId, serverVersion)
+      // If this fails after saveOperation succeeds, Postgres has advanced but
+      // Redis is stuck at the old version.  Delete the key so the next lock
+      // acquisition re-seeds from getMaxOperationVersion rather than reusing
+      // the stale value and hitting a unique-constraint violation on every
+      // subsequent op.  The op IS durably persisted, so the ACK below is valid.
+      try {
+        await setDocVersion(docId, serverVersion)
+      } catch (setVersionErr) {
+        logger.error(
+          { setVersionErr, docId, serverVersion },
+          'op:submit: setDocVersion failed after saveOperation — deleting stale key for self-healing'
+        )
+        try {
+          await deleteDocVersion(docId)
+        } catch (delErr) {
+          logger.error({ delErr, docId }, 'op:submit: failed to delete stale doc-version key')
+        }
+        // Do not re-throw: the op is saved; the version key self-heals on the
+        // next submission when the lock path re-seeds from getMaxOperationVersion.
+      }
 
       // Critical section ends here.  Capture what the post-lock path needs;
       // steps 8–9 (ACK + broadcast) run after the lock is released so that
@@ -186,8 +213,33 @@ export async function handleOpSubmit(
       pendingAck = { serverVersion, transformedOp, authorId: socket.data.userId }
     }
   } catch (err) {
-    logger.error({ err, docId }, 'handleOpSubmit: error processing operation')
-    socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to process operation' })
+    // Unique-constraint violation from saveOperation means Redis was stale:
+    // the version we tried to insert already exists in Postgres.  Delete the
+    // Redis key so the next lock acquisition re-seeds from getMaxOperationVersion
+    // and force the client to resync to a consistent state.
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === 'P2002' &&
+      resolvedVersion !== null
+    ) {
+      logger.error(
+        { err, docId, resolvedVersion },
+        'op:submit: unique-constraint violation — Redis version was stale, forcing reconnect'
+      )
+      try {
+        await deleteDocVersion(docId)
+      } catch (delErr) {
+        logger.error(
+          { delErr, docId },
+          'op:submit: failed to delete stale doc-version key after P2002'
+        )
+      }
+      shouldReconnect = true
+      reconnectVersion = resolvedVersion
+    } else {
+      logger.error({ err, docId }, 'handleOpSubmit: error processing operation')
+      socket.emit(WS.ERROR, { code: 'INTERNAL_ERROR', message: 'Failed to process operation' })
+    }
   } finally {
     // ALWAYS attempt to release the lock — a leaked lock freezes editing for
     // this document. Wrap in try/catch so a Redis network error here does not

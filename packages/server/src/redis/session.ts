@@ -170,6 +170,11 @@ export async function setDocVersion(docId: string, version: number, nx = false):
   }
 }
 
+/** Delete the version counter key for a document (e.g., to force a re-seed). */
+export async function deleteDocVersion(docId: string): Promise<void> {
+  await pubClient.del(`doc-version:${docId}`)
+}
+
 /**
  * Acquire a Redis-backed mutex with a spin-wait.
  * Returns a unique token that the caller MUST pass to `releaseLock`.

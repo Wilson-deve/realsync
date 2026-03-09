@@ -74,8 +74,15 @@ export function registerHandlers(
       // One-doc-per-socket enforcement:
       // Session storage is keyed only by socket.id, so joining a second
       // document would overwrite the single session record while leaving a
-      // stale entry in the previous doc's session set.  Auto-leave any
+      // stale entry in the previous doc's session set.  Auto-leave every
       // existing document room before joining the new one.
+      //
+      // Failure semantics: if any step of the auto-leave fails we abort the
+      // join and return an error to the client.  Continuing after a partial
+      // leave would leave the socket joined to both the old and the new room
+      // simultaneously, causing it to receive broadcasts for a document it no
+      // longer has a valid session for and leaving stale presence entries in
+      // the old room that would never be cleaned up.
       const existingDocRooms = Array.from(socket.rooms).filter(
         (r) => r !== socket.id && r !== docId
       )
@@ -86,7 +93,12 @@ export function registerHandlers(
           const prevSessions = await getDocSessions(prevDocId)
           io.to(prevDocId).emit(WS.PRESENCE_UPDATE, { users: prevSessions })
         } catch (err) {
-          logger.warn({ err, prevDocId, socketId: socket.id }, 'room:join: auto-leave failed')
+          logger.error({ err, prevDocId, socketId: socket.id }, 'room:join: auto-leave failed')
+          socket.emit(WS.ERROR, {
+            code: 'INTERNAL_ERROR',
+            message: 'Failed to leave previous document — please try again',
+          })
+          return
         }
       }
 
