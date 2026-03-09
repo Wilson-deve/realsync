@@ -1,14 +1,6 @@
 import type { Op } from './type'
 
-/**
- * Returns the inverse of an operation such that applying the op and then its
- * inverse leaves the document content unchanged:
- *   `apply(apply(doc, op), invert(op)).content === doc.content`
- *
- * **Important:** for delete ops, `apply()` must be called first so that
- * `op.deletedContent` is populated. Without it, the original text is unknown
- * and the inverse insert cannot be reconstructed.
- */
+/** Returns the inverse of an operation to restore previous document state. */
 export function invert(op: Op): Op {
   switch (op.type) {
     case 'insert':
@@ -25,8 +17,7 @@ export function invert(op: Op): Op {
     }
 
     case 'retain':
-      // Spread the original op so attributes are preserved — dropping them
-      // would make invert(retain) lose formatting metadata.
+      // Spread the original op to preserve attributes.
       return { ...op }
   }
 }

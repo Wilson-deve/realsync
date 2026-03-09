@@ -1,12 +1,6 @@
 import type { DocumentState, Op } from './type'
 
-/**
- * Applies a single operation to a document, returning the new document state.
- *
- * For delete ops, `deletedContent` is set on the op object so that `invert()`
- * can reconstruct the exact inverse insert. Positions are clamped to valid
- * bounds so no operation can throw a range error.
- */
+/** Applies a single operation to a document, returning the new document state. */
 export function apply(doc: DocumentState, op: Op): DocumentState {
   switch (op.type) {
     case 'insert': {

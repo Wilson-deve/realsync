@@ -1,8 +1,6 @@
-/** Base application error with an HTTP status code and machine-readable code. */
 export class AppError extends Error {
   public readonly code: string
   public readonly statusCode: number
-  /** True for expected/handled errors (4xx); false for unexpected ones (5xx). */
   public readonly isOperational: boolean
 
   constructor(code: string, statusCode: number, message: string, isOperational = true) {
@@ -15,7 +13,6 @@ export class AppError extends Error {
   }
 }
 
-/** Convenience factory for the most common error cases. */
 export const Errors = {
   notFound: (resource: string) => new AppError('NOT_FOUND', 404, `${resource} not found`),
   unauthorized: () => new AppError('UNAUTHORIZED', 401, 'Authentication required'),

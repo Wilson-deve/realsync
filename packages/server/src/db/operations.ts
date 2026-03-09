@@ -3,12 +3,7 @@ import type { OpType } from '@prisma/client'
 import type { Op } from '@realsync/ot-engine'
 import { prisma } from './client'
 
-/**
- * Cast a Prisma JsonValue (which is null when the column holds DbNull/JsonNull)
- * back to the attributes shape used by Op types.
- * Returns undefined when there are no attributes so the property is omitted
- * rather than set to null.
- */
+/** Casts a Prisma JsonValue back to the attributes shape used by Op types, omitting undefined. */
 function parseAttributes(raw: Prisma.JsonValue | null): Record<string, unknown> | undefined {
   if (raw === null || raw === undefined) return undefined
   if (typeof raw === 'object' && !Array.isArray(raw)) {
@@ -17,10 +12,7 @@ function parseAttributes(raw: Prisma.JsonValue | null): Record<string, unknown> 
   return undefined
 }
 
-/**
- * Persists a single OT operation to the append-only operation log.
- * `version` is the document version AFTER this operation is applied.
- */
+/** Persists a single OT operation to the append-only operation log. */
 export async function saveOperation(docId: string, userId: string, op: Op, version: number) {
   return prisma.operation.create({
     data: {
@@ -40,12 +32,32 @@ export async function saveOperation(docId: string, userId: string, op: Op, versi
 }
 
 /**
- * Returns all operations on `docId` with version > `sinceVersion`,
- * ordered ascending — ready to be replayed in sequence.
+ * Returns the highest version number persisted for a document, or 0 if no
+ * operations have been stored yet.  Used to re-seed the Redis version counter
+ * after a restart or cache eviction so it never falls behind the DB state.
  */
-export async function getOperationsSince(docId: string, sinceVersion: number): Promise<Op[]> {
+export async function getMaxOperationVersion(docId: string): Promise<number> {
+  const result = await prisma.operation.aggregate({
+    where: { docId },
+    _max: { version: true },
+  })
+  return result._max.version ?? 0
+}
+
+/** Returns all operations on `docId` with version > `sinceVersion` ordered ascending. */
+export async function getOperationsSince(
+  docId: string,
+  sinceVersion: number,
+  upToVersion?: number
+): Promise<Op[]> {
   const rows = await prisma.operation.findMany({
-    where: { docId, version: { gt: sinceVersion } },
+    where: {
+      docId,
+      version: {
+        gt: sinceVersion,
+        ...(upToVersion !== undefined ? { lte: upToVersion } : {}),
+      },
+    },
     orderBy: [{ version: 'asc' }, { id: 'asc' }],
   })
 
