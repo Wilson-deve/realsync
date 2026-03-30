@@ -26,4 +26,7 @@ Thumbs.db
 # Prisma — migrations must be committed; only ignore local shadow db artifacts
 # (nothing to ignore here currently)
 
-.github/
+CLAUDE.md
+AGENTS.md
+.claude/
+agent_docs/

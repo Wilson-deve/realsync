@@ -5,6 +5,7 @@ import { connectRedis, pubClient, subClient } from './redis/client'
 import { prisma } from './db/client'
 import { env } from './config/env'
 import { logger } from './utils/logger'
+import { setupRoutes } from './http/router'
 
 async function main(): Promise<void> {
   await connectRedis()
@@ -14,11 +15,7 @@ async function main(): Promise<void> {
   logger.info('PostgreSQL connected')
 
   const app = express()
-  app.use(express.json())
-
-  app.get('/health', (_req, res) => {
-    res.json({ status: 'ok', version: process.env['npm_package_version'] ?? '0.1.0' })
-  })
+  setupRoutes(app)
 
   const httpServer = createServer(app)
   const io = createWebSocketServer(httpServer)
