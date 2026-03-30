@@ -1,0 +1,189 @@
+{
+  "version": "1",
+  "name": "RealSync REST API",
+  "items": [
+    {
+      "name": "Health",
+      "type": "http",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/health"
+      }
+    },
+    {
+      "name": "Auth",
+      "type": "folder",
+      "items": [
+        {
+          "name": "Register",
+          "type": "http",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/auth/register",
+            "headers": [{ "name": "Content-Type", "value": "application/json", "enabled": true }],
+            "body": {
+              "mode": "json",
+              "json": "{\n  \"email\": \"wilson@realsync.app\",\n  \"name\": \"Wilson Nshimyimana\",\n  \"password\": \"securepassword123\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Login",
+          "type": "http",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/auth/login",
+            "headers": [{ "name": "Content-Type", "value": "application/json", "enabled": true }],
+            "body": {
+              "mode": "json",
+              "json": "{\n  \"email\": \"wilson@realsync.app\",\n  \"password\": \"securepassword123\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Refresh Token",
+          "type": "http",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/auth/refresh",
+            "headers": [{ "name": "Content-Type", "value": "application/json", "enabled": true }],
+            "body": {
+              "mode": "json",
+              "json": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Workspaces",
+      "type": "folder",
+      "items": [
+        {
+          "name": "Get Workspace",
+          "type": "http",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/workspaces/{{workspaceId}}",
+            "headers": [{ "name": "Authorization", "value": "Bearer {{token}}", "enabled": true }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Documents",
+      "type": "folder",
+      "items": [
+        {
+          "name": "Create Document",
+          "type": "http",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/docs",
+            "headers": [
+              { "name": "Authorization", "value": "Bearer {{token}}", "enabled": true },
+              { "name": "Content-Type", "value": "application/json", "enabled": true }
+            ],
+            "body": {
+              "mode": "json",
+              "json": "{\n  \"title\": \"Architecture Notes\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Document",
+          "type": "http",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/docs/{{docId}}",
+            "headers": [{ "name": "Authorization", "value": "Bearer {{token}}", "enabled": true }]
+          }
+        },
+        {
+          "name": "Update Document",
+          "type": "http",
+          "request": {
+            "method": "PATCH",
+            "url": "{{baseUrl}}/docs/{{docId}}",
+            "headers": [
+              { "name": "Authorization", "value": "Bearer {{token}}", "enabled": true },
+              { "name": "Content-Type", "value": "application/json", "enabled": true }
+            ],
+            "body": {
+              "mode": "json",
+              "json": "{\n  \"title\": \"Updated Architecture Notes\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Delete Document",
+          "type": "http",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/docs/{{docId}}",
+            "headers": [{ "name": "Authorization", "value": "Bearer {{token}}", "enabled": true }]
+          }
+        },
+        {
+          "name": "Get Document History",
+          "type": "http",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/docs/{{docId}}/history?page=1&limit=50",
+            "headers": [{ "name": "Authorization", "value": "Bearer {{token}}", "enabled": true }]
+          }
+        },
+        {
+          "name": "Create Share Link",
+          "type": "http",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/docs/{{docId}}/share",
+            "headers": [
+              { "name": "Authorization", "value": "Bearer {{token}}", "enabled": true },
+              { "name": "Content-Type", "value": "application/json", "enabled": true }
+            ],
+            "body": {
+              "mode": "json",
+              "json": "{\n  \"role\": \"viewer\",\n  \"expiresInDays\": 7\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Webhooks",
+      "type": "folder",
+      "items": [
+        {
+          "name": "Create Webhook",
+          "type": "http",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/webhooks",
+            "headers": [
+              { "name": "Authorization", "value": "Bearer {{token}}", "enabled": true },
+              { "name": "Content-Type", "value": "application/json", "enabled": true }
+            ],
+            "body": {
+              "mode": "json",
+              "json": "{\n  \"url\": \"https://example.com/webhooks/realsync\",\n  \"events\": [\"document.created\", \"document.updated\", \"document.deleted\"]\n}"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "environments": [
+    {
+      "name": "local",
+      "variables": [
+        { "name": "baseUrl", "value": "http://localhost:4000", "enabled": true },
+        { "name": "token", "value": "", "enabled": true },
+        { "name": "refreshToken", "value": "", "enabled": true },
+        { "name": "workspaceId", "value": "", "enabled": true },
+        { "name": "docId", "value": "", "enabled": true }
+      ]
+    }
+  ]
+}

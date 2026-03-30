@@ -43,6 +43,16 @@ model Workspace {
   documents  Document[]
   users      User[]
   auditLogs  AuditLog[]
+  webhooks   Webhook[]
+}
+
+model Webhook {
+  id          String    @id @default(cuid())
+  workspaceId String
+  url         String
+  events      String[]
+  createdAt   DateTime  @default(now())
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
 }
 
 model Document {
@@ -70,19 +80,22 @@ model Operation {
   version    Int
   timestamp  DateTime @default(now())
   document   Document @relation(fields: [docId], references: [id])
+  user       User     @relation(fields: [userId], references: [id])
 
   @@unique([docId, version])
 }
 
 model User {
-  id          String    @id @default(cuid())
-  email       String    @unique
-  name        String
-  avatarUrl   String?
-  workspaceId String
-  role        Role      @default(EDITOR)
-  createdAt   DateTime  @default(now())
-  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+  id           String      @id @default(cuid())
+  email        String      @unique
+  name         String
+  passwordHash String      @default("")
+  avatarUrl    String?
+  workspaceId  String
+  role         Role        @default(EDITOR)
+  createdAt    DateTime    @default(now())
+  workspace    Workspace   @relation(fields: [workspaceId], references: [id])
+  operations   Operation[]
 }
 
 model AuditLog {
